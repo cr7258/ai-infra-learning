@@ -10,3 +10,7 @@
 | LoRA Adapters    |       | [Doc: LoRA Adapters](https://docs.vllm.ai/en/stable/features/lora.html)<br>[Paper: LoRA: Low-Rank Adaptation of Large Language Models](https://arxiv.org/abs/2106.09685) | ||
 | Quantization      |      |       |                      | |
 | Distributed Inference and Serving | | [Doc: Distributed Inference and Serving](https://docs.vllm.ai/en/stable/serving/distributed_serving.html)|  ||
+
+## 交流群
+
+<img src=https://github.com/user-attachments/assets/b0451ab2-b16e-4079-8b0a-b5893097572a width=60% />
