@@ -14,3 +14,7 @@
 ## 交流群
 
 <img src=https://github.com/user-attachments/assets/b0451ab2-b16e-4079-8b0a-b5893097572a width=60% />
+
+<img src=https://github.com/user-attachments/assets/d2362785-c05a-4b5b-aaa7-49e939ccfc02 width=50% />
+
+![搜索框传播样式-白色版](https://github.com/user-attachments/assets/bf4c1c47-4e85-407b-8143-68a59b474186)
