@@ -529,7 +529,7 @@ DCAB | EFGH
 
 ## 5 Prefix Cache Aware Routing
 
-Prefix Caching 虽然能有效减少单个实例内部的 KV Cache 重复计算，但在多副本部署场景下，仅靠单实例的缓存复用远远不够。即使多个请求具有相同前缀，仍可能被随机分配到不同实例，导致每个实例都重复计算并缓存相同前缀。Prefix Cache Aware Routing 则是为了解决这个问题，它能根据请求前缀的匹配情况，智能地将请求路由到已有缓存的 worker，从而在集群层面实现更高效的 KV Cache 缓存利用率。
+Prefix Caching 虽然能有效减少单个实例内部的 KV Cache 重复计算，但在多副本部署场景下，仅靠单实例的缓存复用远远不够。即使多个请求具有相同前缀，仍可能被随机分配到不同实例，导致每个实例都重复计算并缓存相同前缀。Prefix Cache Aware Routing 则是为了解决这个问题，它能根据请求前缀的匹配情况，智能地将请求路由到已有缓存的 worker，从而在集群层面实现更高效的 KV Cache 利用率。
 
 目前，已经有不少项目实现了 Prefix Cache Aware Routing，例如：
 
