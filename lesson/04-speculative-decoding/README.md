@@ -133,7 +133,7 @@ q_prob = 0.22
 计算接受概率：
 
 $$
-\text{accept\_prob}_1 = \min\left(1,\ \frac{q\_prob}{p\_prob} \right) = \min(1,\ \frac{0.22}{0.30}) = 0.733
+\text{acceptprob}_1 = \min\left(1,\ \frac{qprob}{pprob} \right) = \min(1,\ \frac{0.22}{0.30}) = 0.733
 $$
 
 假设采样出的随机数 $r_1 = 0.42$，因为：
@@ -154,7 +154,7 @@ q_prob = q_probs_2["very"] = 0.24
 ```
 
 $$
-\text{accept\_prob}_2 = \min\left(1,\ \frac{0.24}{0.28} \right) = 0.857
+\text{acceptprob}_2 = \min\left(1,\ \frac{0.24}{0.28} \right) = 0.857
 $$
 
 随机数 $r_2$ = 0.62，因为：
