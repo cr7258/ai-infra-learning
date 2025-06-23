@@ -1,4 +1,4 @@
-# Speculative Decoding 推测解码
+## Speculative Decoding 推测解码方案详解
 
 当前，大型语言模型（LLM）在推理阶段普遍采用自回归解码策略，其核心特性是**逐步串行生成 token，每一步都依赖前一步的输出**。这一计算模式导致推理过程在系统层面面临严重的**内存带宽瓶颈**：每一步前向计算都需要将**完整的模型参数从高带宽内存（HBM）加载到加速器缓存**，但仅生成一个 token。由于每次只生成一个 token，导致大量的计算资源被闲置，无法充分发挥加速器的算力潜力，最终造成整体推理效率低下。
 
@@ -88,17 +88,19 @@ vocab = ["This", "apple", "is", "very", "delicious", "bad", "today"]
 
 本轮草稿长度 K=2，也就是说草稿模型 `p` 将尝试生成两个 token。
 
-**第一步：草稿模型生成 token，并记录 logits**
+**第一步：草稿模型生成 token**
 
-草稿模型 `p` 是一个轻量的自回归模型。每一步先计算 logits，再通过 softmax 得到概率分布，最终采样生成 token；这些 logits 会被记录下来，用于之后的目标模型验分。
+草稿模型 `p` 是一个轻量的自回归模型。每一步会计算 logits，并通过 softmax 得到概率分布，从中采样出下一个 token。**草稿模型对每个生成 token 的概率（即 softmax 后的值）会被保留，用于之后目标模型的验分过程。**
 
 ```python
 # 基于上下文 "This apple"，预测出下一个 token：
-p_logits_1 = [1.5, 1.8, 2.5, 1.1, 0.3, 0.05, -1.0]  # for "This apple"
+p_logits_1 = [1.5, 1.8, 2.5, 1.1, 0.3, 0.05, -1.0]  # 草稿模型 logits for "This apple"
+p_probs_1 = softmax(p_logits_1)                     # 草稿模型计算 softmax 概率
 # → 草稿模型生成：𝑥̃₁ = "is"
 
 # 接着以 "This apple is" 为上下文继续预测：
-p_logits_2 = [0.7, 0.9, 1.0, 1.3, 0.4, 0.1, -0.8]  # for "This apple is"
+p_logits_2 = [0.7, 0.9, 1.0, 1.3, 0.4, 0.1, -0.8]  # 草稿模型 logits for "This apple is"
+p_probs_2 = softmax(p_logits_2)                    # 草稿模型计算 softmax 概率
 # → 草稿模型生成：𝑥̃₂ = "very"
 ```
 
@@ -107,23 +109,22 @@ p_logits_2 = [0.7, 0.9, 1.0, 1.3, 0.4, 0.1, -0.8]  # for "This apple is"
 目标模型 `q` 是较大但更精确的模型，得益于草稿 token 已经生成完毕，可以**并行地**对草稿序列的每个位置进行打分（即计算 logits），从而加快验分过程。
 
 ```python
-q_logits_1 = [1.8, 2.0, 2.2, 1.2, 0.5, 0.1, -0.7]   # q(x | "This apple")
+q_logits_1 = [1.8, 2.0, 2.2, 1.2, 0.5, 0.1, -0.7]   # 目标模型 q(x | "This apple")
 q_logits_2 = [0.9, 1.1, 1.0, 1.1, 0.7, 0.2, -0.5]   # q(x | "This apple is")
 q_logits_3 = [0.5, 0.4, 1.2, 0.7, 2.5, -0.2, 0.0]   # q(x | "This apple is very")
+
+q_probs_1 = softmax(q_logits_1)
+q_probs_2 = softmax(q_logits_2)
 ```
 
-**第三步：对草稿 token 验分**
+**第三步：目标模型对草稿 token 验分**
 
-对第一个草稿 token：`𝑥̃₁ = "is"`，查找 softmax 概率：
+对第一个草稿 token：`𝑥̃₁ = "is"`，分别查找两个模型计算出的 softmax 概率：
 
 ```python
-# 从 logits 得到概率分布（softmax）：
-p_probs_1 = softmax(p_logits_1)
-q_probs_1 = softmax(q_logits_1)
-
 # 提取 token "is" 对应的概率：
-p_prob = p_probs_1["is"]
-q_prob = q_probs_1["is"]
+p_prob = p_probs_1["is"]  # 草稿模型计算的概率
+q_prob = q_probs_1["is"]  # 目标模型计算的概率
 
 # 假设：
 p_prob = 0.30
@@ -139,29 +140,28 @@ $$
 假设采样出的随机数 $r_1 = 0.42$，因为：
 
 $$
-0.42 < 0.733 \quad \Rightarrow \quad ✅ 接受 "is"
+0.42 < 0.733 \quad \Rightarrow \quad 接受 "is"
 $$
+
+---
 
 对第二个草稿 token：`𝑥̃₂ = "very"`：
 
 ```python
-p_probs_2 = softmax(p_logits_2)
-q_probs_2 = softmax(q_logits_2)
-
-# 假设
-p_prob = p_probs_2["very"] = 0.28
-q_prob = q_probs_2["very"] = 0.24
+p_prob = p_probs_2["very"] = 0.28  # 草稿模型计算的概率
+q_prob = q_probs_2["very"] = 0.24  # 目标模型计算的概率
 ```
 
 $$
 \text{acceptprob}_2 = \min\left(1,\ \frac{0.24}{0.28} \right) = 0.857
 $$
 
-随机数 $r_2$ = 0.62，因为：
+随机数 $r_2 = 0.62$，因为：
 
 $$
-0.62 < 0.857 \quad \Rightarrow \quad ✅ 接受 "very"
+0.62 < 0.857 \quad \Rightarrow \quad 接受 "very"
 $$
+
 
 **第四步：生成奖励 token（bonus token）**
 
@@ -186,7 +186,7 @@ xₙ₊ₖ₊₁ = "delicious"
 
 ## 3 草稿模型的限制
 
-虽然推测解码通过“猜测-验证”策略，在多个场景下显著提升了解码速度，但草稿模型仍然存在以下限制：
+虽然 Speculative Decoding 通过“猜测-验证”策略，在多个场景下显著提升了解码速度，但草稿模型仍然存在以下限制：
 
 - **接受率受限，加速效果不稳定**：草稿模型的预测结果必须通过大模型的验证才能被接受。加速效果高度依赖 token 的接受率（Acceptance Rate）。一旦接受率较低，不仅无法提升性能，反而会因为重复验证和回退而拖慢整体解码速度。
 - **难以获得“又小又准”的模型**：要让草稿模型既轻量又能精准模拟大模型的行为非常困难。现实中经常出现 distribution shift（分布偏移），即草稿模型与大模型输出之间存在差异，导致预测失败率上升。
@@ -199,13 +199,13 @@ xₙ₊ₖ₊₁ = "delicious"
 
 **Prompt Lookup Decoding** 正是利用了这一规律，在生成过程中加速自回归解码。它通过高效的字符串匹配算法（如 KMP）快速定位匹配位置，直接利用 prompt 中已有的信息进行预测，而**无需依赖额外的草稿模型**生成候选 token。尤其在模型输出高度重复 prompt 内容的场景下，这种方法能显著提升推理效率。当大模型在答案中重复 prompt 的内容时，这种方法效果尤为显著。
 
-> vLLM 的 n-gram 推测解码不仅仅使用原始提示进行匹配，而是使用整个上下文序列（包括原始提示和已生成的标记）。每次生成新标记后，整个上下文序列都会更新，然后用于下一轮的 n-gram 匹配。
+> vLLM 的 n-gram Speculative Decoding 不仅仅使用原始提示进行匹配，而是使用整个上下文序列（包括原始提示和已生成的标记）。每次生成新标记后，整个上下文序列都会更新，然后用于下一轮的 n-gram 匹配。
 
 ![](https://chengzw258.oss-cn-beijing.aliyuncs.com/Article/202506211038538.png)
 
 上图展示了一个 Prompt Lookup Decoding 的示例：给定一个 prompt，我们会提取其中所有的 2-gram 作为查找键（key），并将它们后面紧跟的三个 token 作为查找值（value）。在生成过程中，我们会检查当前生成的 2-gram 是否与查找表中的某个 key 匹配。如果匹配成功，就使用对应的 value 作为后续的候选 token 进行生成。
 
-在下面这段代码中，我们使用了 n-gram 推测解码，每次最多推测 3 个 token，最多使用 2 个 n-gram 进行匹配。
+在下面这段代码中，我们使用了 n-gram Speculative Decoding，每次最多推测 3 个 token，最多使用 2 个 n-gram 进行匹配。
 
 ```python
 from vllm import LLM, SamplingParams
@@ -219,7 +219,7 @@ llm = LLM(
     model="facebook/opt-6.7b",
     tensor_parallel_size=1,
     speculative_config={
-        "method": "ngram", # 使用 n-gram 推测解码
+        "method": "ngram", # 使用 n-gram Speculative Decoding
         "num_speculative_tokens": 3, # 每次最多推测 3 个 token
         "prompt_lookup_max": 2, # 最多使用 2 个 n-gram 进行匹配
     },
@@ -249,7 +249,7 @@ Jacobi 迭代法是一种经典的非线性方程组求解方法。在大语言�
 
 Jacobi 解码之所以可以让大模型并行预测多个 token，是因为它将原本自回归的串行生成过程转化为了一个非线性系统的“并行迭代求解”问题。每一轮都用大模型，在不同位置上并行预测 token，并使用上一轮的结果作为输入，而不是依赖本轮刚生成的内容。
 
-![](https://chengzw258.oss-cn-beijing.aliyuncs.com/Article/202506212210549.gif)
+![](jacobi-decoding.gif)
 
 上图展示了这一并行解码过程（也称为 Jacobi 解码）。Jacobi 解码能够在最多 $m$ 步内求解所有 $m$ 个变量（即，与自回归解码所需步数相同），因为每一步至少能够保证第一个 token 被正确解码。有时候，多个 token 可能会在一次迭代中同时收敛，从而减少整体解码步数。例如，Jacobi 解码在第 4 步中同时预测并接受了两个 token：“computer” 和 “scientist”。
 
@@ -293,7 +293,7 @@ Lookahead Decoding 正是利用了这一特性：**收集 Jacobi 生成路径中
 
 ### 7.1 Medusa heads
 
-Medusa 之所以能够一次性解码多个 token，核心在于它在原始语言模型的**最后隐藏层输出之上，附加了多个解码头（Medusa heads）**。每个解码头负责预测序列中不同偏移位置的未来 token，例如位置 $t+1$、$t+2$、$t+3$ 等。这些解码头结构类似于原始模型的语言模型头，通常是单层前馈神经网络，可以独立地为其目标位置生成 token 预测。这种设计使得模型在一次前向传播中即可**并行预测多个后续 token**，而不再像传统自回归生成方式那样必须逐步生成单个 token，从而显著提升解码效率。
+Medusa 之所以能够一次性解码多个 token，核心在于它在原始语言模型的**最后隐藏层输出之上，附加了多个解码头（Medusa heads）**。每个解码头负责预测序列中不同偏移位置的未来 token。这些解码头结构类似于原始模型的语言模型头，通常是单层前馈神经网络，可以独立地为其目标位置生成 token 预测。这种设计使得模型在一次前向传播中即可**并行预测多个后续 token**，而不再像传统自回归生成方式那样必须逐步生成单个 token，从而显著提升解码效率。
 
 具体来说：
 
@@ -432,7 +432,7 @@ Medusa 在推理时，每个解码头不仅输出一个最可能的 token，而�
 **Rejection Sampling 是怎么做的：**
 
 * draft 模型采样出 `"fun"`；
-* 原始模型检查 `"fun"` 的概率只有 **0.08**，**直接拒绝**；
+* 原始模型判断 `"fun"` 的概率仅为 **0.08**（例如，草稿模型预测 `"fun"` 的概率为 0.8，而原始模型仅为 0.08，假设随机数 $r = 0.5$，由于 $r > 0.08 / 0.8 = 0.1$，因此该 token 被拒绝）。具体可参考第 2 小节中的拒绝采样示例。
 * 然后重新采样，直到采到像 `"nice"` 或 `"bad"` 这样高概率的 token；
 * 如果 draft 和原始模型温度不一致，这个过程会不断重试，效率变低。
 
@@ -466,9 +466,9 @@ EAGLE（Extrapolation Algorithm for Greater Language-model Efficiency）提出�
 - 通过引入提前一步的 token 序列，解决了特征预测中的不确定性问题，从而提升预测的准确性和草稿生成质量。
 - 该方法无需对目标 LLM 进行微调，保证生成文本的分布与传统自回归解码一致，实现无损加速。
 
-EAGLE 经第三方评估认证，是目前最快的推测解码方法：
+EAGLE 经第三方评估认证，是目前最快的 Speculative Decoding 方法：
 
-- 比常规推测解码快 3 倍（在 13B 模型上）；
+- 比常规 Speculative Decoding 快 3 倍（在 13B 模型上）；
 - 比 Lookahead 快 2 倍（在 13B 模型上）；
 - 比 Medusa 快 1.6 倍（在 13B 模型上）；
 
@@ -639,7 +639,7 @@ $$
 | `"bad"`       | 0.1   | 0.034       |
 | `"today"`     | -0.7  | 0.016       |
 
-总的来说，logits 是 LLM 中预测下一个词的“未归一化概率得分”，是生成过程中的关键中间表示，决定了模型如何选择下一个输出 token。
+总的来说，logits 是 LLM 中预测下一个词的“未归一化概率得分”，是生成过程中的关键中间表示，决定了模型如何选择下一个输出 token。**logits 的长度等于词表（vocabulary）的大小。**
 
 ### 9.2 雅可比迭代法（Jacobi method）
 
@@ -1094,3 +1094,7 @@ $$
 - Speculative Decoding 论文阅读合订本：https://zhuanlan.zhihu.com/p/684217993
 - Andrej Karpathy X：https://x.com/karpathy/status/1697318534555336961
 - Lookahead Decoding 图文详解：https://zhuanlan.zhihu.com/p/701015670
+
+## 欢迎关注
+
+![](https://chengzw258.oss-cn-beijing.aliyuncs.com/Article/202503222156941.png)
