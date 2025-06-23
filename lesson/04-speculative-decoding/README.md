@@ -271,7 +271,7 @@ Lookahead Decoding 正是利用了这一特性：**收集 Jacobi 生成路径中
 
 整个过程中，Lookahead Decoding 不依赖草稿模型，部署简洁，同时借助前瞻生成与并行验证两个分支，在单步内完成多个候选的生成与验证，最大化利用了原本未被自回归解码充分使用的计算资源。
 
-![](https://chengzw258.oss-cn-beijing.aliyuncs.com/Article/202506212230325.gif)
+![](lookahead-decoding.gif)
 
 ## 7 Medusa
 
@@ -472,7 +472,7 @@ EAGLE 经第三方评估认证，是目前最快的 Speculative Decoding 方法�
 - 比 Lookahead 快 2 倍（在 13B 模型上）；
 - 比 Medusa 快 1.6 倍（在 13B 模型上）；
 
-![](https://chengzw258.oss-cn-beijing.aliyuncs.com/Article/202506221405754.gif)
+![](eagle.gif)
 
 在 vLLM 中，可以通过如下方式启用 EAGLE。需要注意的是，EAGLE 的草稿模型需在**不启用张量并行**的模式下运行，而目标模型则可以正常使用张量并行以提升推理效率。
 
