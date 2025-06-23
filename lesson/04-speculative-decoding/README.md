@@ -743,60 +743,121 @@ $$
 应用雅可比迭代法的单元素更新公式：
 
 对于 $x_1$：
+
 $$
-x_1^{(k+1)} = \frac{1}{a_{11}} \left( b_1 - \sum_{j \neq 1} a_{1j} x_j^{(k)} \right) = \frac{1}{4} \left( 6 - 1 \cdot x_2^{(k)} - 1 \cdot x_3^{(k)} \right)
+x_1^{(k+1)} = \frac{1}{a_{11}} \left( b_1 - \sum_{j \ne 1} a_{1j} x_j^{(k)} \right)
+= \frac{1}{4} \left( 6 - 1 \cdot x_2^{(k)} - 1 \cdot x_3^{(k)} \right)
 $$
 
 对于 $x_2$：
+
 $$
-x_2^{(k+1)} = \frac{1}{a_{22}} \left( b_2 - \sum_{j \neq 2} a_{2j} x_j^{(k)} \right) = \frac{1}{5} \left( 7 - 1 \cdot x_1^{(k)} - 1 \cdot x_3^{(k)} \right)
+x_2^{(k+1)} = \frac{1}{a_{22}} \left( b_2 - \sum_{j \ne 2} a_{2j} x_j^{(k)} \right)
+= \frac{1}{5} \left( 7 - 1 \cdot x_1^{(k)} - 1 \cdot x_3^{(k)} \right)
 $$
 
 对于 $x_3$：
-$$
-x_3^{(k+1)} = \frac{1}{a_{33}} \left( b_3 - \sum_{j \neq 3} a_{3j} x_j^{(k)} \right) = \frac{1}{6} \left( 8 - 1 \cdot x_1^{(k)} - 1 \cdot x_2^{(k)} \right)
-$$
-
-假设初始值 $x^{(0)} = \begin{bmatrix} 0 \\ 0 \\ 0 \end{bmatrix}$，进行迭代计算：
-
-**第一次迭代**：
-$$
-x_1^{(1)} = \frac{1}{4} \left( 6 - 0 - 0 \right) = 1.5
-$$
 
 $$
-x_2^{(1)} = \frac{1}{5} \left( 7 - 0 - 0 \right) = 1.4
+x_3^{(k+1)} = \frac{1}{a_{33}} \left( b_3 - \sum_{j \ne 3} a_{3j} x_j^{(k)} \right)
+= \frac{1}{6} \left( 8 - 1 \cdot x_1^{(k)} - 1 \cdot x_2^{(k)} \right)
 $$
 
-$$
-x_3^{(1)} = \frac{1}{6} \left( 8 - 0 - 0 \right) = 1.333
-$$
-
-所以 $x^{(1)} = \begin{bmatrix} 1.5 \\ 1.4 \\ 1.333 \end{bmatrix}$
-
-**第二次迭代**：
-$$
-x_1^{(2)} = \frac{1}{4} \left( 6 - 1.4 - 1.333 \right) = \frac{3.267}{4} \approx 0.817
-$$
+假设初始值为：
 
 $$
-x_2^{(2)} = \frac{1}{5} \left( 7 - 1.5 - 1.333 \right) = \frac{4.167}{5} \approx 0.833
+x^{(0)} = 
+\begin{bmatrix}
+0 \\
+0 \\
+0
+\end{bmatrix}
+$$
+
+进行迭代计算：
+
+第一次迭代：
+
+$$
+x_1^{(1)} = \frac{1}{4}(6 - 0 - 0) = 1.5
 $$
 
 $$
-x_3^{(2)} = \frac{1}{6} \left( 8 - 1.5 - 1.4 \right) = \frac{5.1}{6} = 0.85
+x_2^{(1)} = \frac{1}{5}(7 - 0 - 0) = 1.4
 $$
 
-所以 $x^{(2)} = \begin{bmatrix} 0.817 \\ 0.833 \\ 0.85 \end{bmatrix}$
+$$
+x_3^{(1)} = \frac{1}{6}(8 - 0 - 0) = 1.333
+$$
 
-继续迭代，最终会收敛到精确解 $x = \begin{bmatrix} 1 \\ 1 \\ 1 \end{bmatrix}$，可以验证：
+所以：
+
 $$
-\begin{bmatrix} 
-4 & 1 & 1 \\ 
-1 & 5 & 1 \\ 
-1 & 1 & 6 
-\end{bmatrix} \begin{bmatrix} 1 \\ 1 \\ 1 \end{bmatrix} = \begin{bmatrix} 6 \\ 7 \\ 8 \end{bmatrix}
+x^{(1)} = 
+\begin{bmatrix}
+1.5 \\
+1.4 \\
+1.333
+\end{bmatrix}
 $$
+
+第二次迭代：
+
+$$
+x_1^{(2)} = \frac{1}{4}(6 - 1.4 - 1.333) = \frac{3.267}{4} \approx 0.817
+$$
+
+$$
+x_2^{(2)} = \frac{1}{5}(7 - 1.5 - 1.333) = \frac{4.167}{5} \approx 0.833
+$$
+
+$$
+x_3^{(2)} = \frac{1}{6}(8 - 1.5 - 1.4) = \frac{5.1}{6} \approx 0.85
+$$
+
+所以：
+
+$$
+x^{(2)} = 
+\begin{bmatrix}
+0.817 \\
+0.833 \\
+0.85
+\end{bmatrix}
+$$
+
+继续迭代，最终会收敛到精确解：
+
+$$
+x = 
+\begin{bmatrix}
+1 \\
+1 \\
+1
+\end{bmatrix}
+$$
+
+可以验证：
+
+$$
+\begin{bmatrix}
+4 & 1 & 1 \\
+1 & 5 & 1 \\
+1 & 1 & 6
+\end{bmatrix}
+\begin{bmatrix}
+1 \\
+1 \\
+1
+\end{bmatrix}
+\=
+\begin{bmatrix}
+6 \\
+7 \\
+8
+\end{bmatrix}
+$$
+
 
 这个例子展示了雅可比迭代法如何通过反复应用单元素更新公式，逐步逼近三维线性方程组的解。
 
