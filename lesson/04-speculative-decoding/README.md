@@ -58,8 +58,8 @@ for output in outputs:
 
 ```bash
 vllm serve \
-  --model facebook/opt-6.7b \
-  --speculative_config '{"model": "facebook/opt-125m", "num_speculative_tokens": 5}'
+  facebook/opt-6.7b \
+  --speculative-config '{"model": "facebook/opt-125m", "num_speculative_tokens": 5}'
 ```
 
 ## 2 早期的 Speculative Decoding
