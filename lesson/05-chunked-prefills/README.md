@@ -433,31 +433,17 @@ $$
 ## 5 参考资料
 
 - 图解大模型计算加速系列：分离式推理架构2，模糊分离与合并边界的Chunked-Prefills：https://zhuanlan.zhihu.com/p/710165390
-
 - 大模型推理核心技术之Continuous Batching和我的WXG往事：https://zhuanlan.zhihu.com/p/676109470
-
 - How continuous batching enables 23x throughput in LLM inference while reducing p50 latency：https://www.anyscale.com/blog/continuous-batching-llm-inference
-
 - vllm调度笔记：chunked prefill调度策略：https://zhuanlan.zhihu.com/p/711209924
-
 - vLLM调度器解密（下）：chunked prefill是如何进一步优化的？：https://zhuanlan.zhihu.com/p/6144374775
-
 - vLLM Optimization and Tuning：https://docs.vllm.ai/en/latest/configuration/optimization.html
-
 - [EXTERNAL] OSS Chunked Prefill Evaluation：https://docs.google.com/document/d/1W6t6wouQKgl1QivS7gbkkY5xtR9Q6wvXbmOL-1onMmk/edit?tab=t.0#heading=h.8um4c511b0b0
-
 - [RFC] Upstream Chunked Prefill：https://github.com/vllm-project/vllm/issues/3130
-
 - NVIDIA NIM LLMs Benchmarking：https://docs.nvidia.com/nim/benchmarking/llm/latest/metrics.html#inter-token-latency-itl
-
 - Matrix-vector and Matrix-matrix Multiplication：https://www.youtube.com/watch?v=7CBkZq3eQ_0
-
 - Paradigms of Parallelism：https://colossalai.org/docs/concepts/paradigms_of_parallelism
 
-  
+## 欢迎关注
 
-  ## 欢迎关注
-
-  ![](https://chengzw258.oss-cn-beijing.aliyuncs.com/Article/202503222156941.png)
-
-  
+![](https://chengzw258.oss-cn-beijing.aliyuncs.com/Article/202503222156941.png)
