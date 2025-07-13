@@ -341,9 +341,13 @@ Total num prompt tokens:  215196
 Total num output tokens:  198343
 ```
 
-## 4 附录
+## 4 总结
 
-### 4.1 推理中衡量延迟的几个术语
+文章介绍了大模型推理中 prefill 与 decode 阶段在资源利用上的差异所带来的调度挑战，并回顾了从 Static Batching 到 Continuous Batching 的策略演进。为解决传统静态或迭代调度中存在的资源浪费与延迟问题，Sarathi-Serve 提出了 chunked-prefills 和 stall-free scheduling 机制，通过将长 prompt 拆分为多个小块，并与 decode 请求混合调度，从而实现高吞吐与低延迟的平衡。
+
+## 5 附录
+
+### 5.1 推理中衡量延迟的几个术语
 
 - **TTFT**（Time To First Token）：指从用户发出请求到模型生成第一个 token 所花费的时间，用于衡量 prefill 阶段的性能。
 - **TBT**（Time Between Tokens）：指连续生成两个 token 之间所花费的时间，反映每个 token 的生成速度。
@@ -356,7 +360,7 @@ $$
 $$
 ![](https://chengzw258.oss-cn-beijing.aliyuncs.com/Article/202507131705925.png)
 
-### 4.2 Batch 机制
+### 5.2 Batch 机制
 
 在经典的批处理机制中，每次迭代时，Transformer 层会接收一个形状为 `[B, L, H]` 的三维输入张量，该张量是通过将一个 batch 中多个请求的 `[L, H]` 输入张量拼接而成的。其中：
 
@@ -406,7 +410,7 @@ $$
 
 这个 `[B=2, L=3, H=10]` 的张量就可以作为 Transformer 一层的输入参与批处理计算。
 
-### 4.3 张量并行和流水线并行
+### 5.3 张量并行和流水线并行
 
 随着大语言模型（LLM）规模不断扩大，推理时必须跨多张 GPU 或多节点部署。为了解决单张 GPU 显存不足、单节点容量受限的问题，**模型并行（Model Parallelism）** 成为必要手段。而流水线并行（PP）是当前跨节点部署模型的主流方式，其核心优势是通信开销小、扩展性好。
 
@@ -422,7 +426,7 @@ $$
 
 因此，在缺乏高速互联（如 NVLink）的跨节点部署中，PP 是唯一可行且高效的模型并行方式，能将每节点的最大 batch size 提高 2–3 倍，大幅增强推理吞吐。
 
-### 4.4 micro-batch 微批
+### 5.4 micro-batch 微批
 
 **micro-batch（微批）** 是将一个完整的 batch 拆分成多个更小的子批次，用于提升硬件资源利用率，尤其在**流水线并行（Pipeline Parallelism）** 中非常常见。
 
@@ -430,7 +434,7 @@ $$
 
 举个例子，如果一个 batch 有 64 个样本，可以被拆成 8 个 micro-batch，每个包含 8 个样本，在模型各阶段中交错处理，从而避免 GPU 空转，提高执行效率。每个阶段表示模型中一部分连续的层，由一个 GPU 负责计算。例如，在一个 12 层的 Transformer 模型中，若使用 4 个 GPU，则每个阶段可能包含 3 层。
 
-## 5 参考资料
+## 6 参考资料
 
 - 图解大模型计算加速系列：分离式推理架构2，模糊分离与合并边界的Chunked-Prefills：https://zhuanlan.zhihu.com/p/710165390
 - 大模型推理核心技术之Continuous Batching和我的WXG往事：https://zhuanlan.zhihu.com/p/676109470
