@@ -1,11 +1,4 @@
-# PD 分离推理架构详解
-
-在大语言模型推理过程中，prefill 阶段和 decode 阶段具有截然不同的计算特性：
-
-- prefill 阶段需要并行处理整个输入序列来生成首个 token，属于计算密集型操作。
-- decode 阶段则逐个生成后续 token，需要频繁访问 KV cache，属于内存密集型操作。
-
-传统的 continuous batching 将两个阶段混合处理，导致相互干扰，难以同时满足 TTFT（首 token 延迟）和 TPOT（token 间延迟）的严格要求。为了解决这一问题，PD 分离架构应运而生，通过将 prefill 和 decode 分配到不同的 GPU 实例上，针对各自特性进行专门优化。这种分离式设计不仅消除了阶段间的干扰，还能显著提升系统的有效吞吐量（Goodput），为大规模 LLM 服务提供了更优的解决方案。
+# PD 分离
 
 ## 1 吞吐量（Throughput）vs 有效吞吐量（Goodput）
 
@@ -89,7 +82,7 @@ Goodput (2P1D) = min(5.6 × 2, 10) = 10 reqs/s ÷ 3 GPUs ≈ 3.3 rps/GPU。
 ### 4.1 算力与存储
 
 - prefill 阶段：拥有计算受限的性质（compute-bound），特别是在请求流量较大，用户的 prompt 也比较长的情况下。prefill 阶段算完 KV cache 并发给 decode 阶段后，理论上 prefill 就不再需要这个 KV cache 了（当然你也可以采用 LRU 等策略对 KV cache 的保存做管理，而不是一股脑地清除）。
-- decode 阶段：拥有内存受限的性质（memory-bound），因为逐个 token 的生成方式，decode 阶段要频繁从内存中读取 KV Cache，同时也意味着它需要尽可能保存 KV cache。
+- decode 阶段：拥有存储受限的性质（memory-bound），因为逐个 token 的生成方式，decode 阶段要频繁从存储中读取 KV Cache，同时也意味着它需要尽可能保存 KV cache。
 
 因此在分离式框架下，计算和存储可以朝着两个独立的方向做优化。
 
@@ -165,7 +158,7 @@ KV cache 传输粒度可以分为 3 类：
 
 - **块级**：TetriInfer 在 PD 分离的基础上，还会将输入的 prompt 划分为固定大小的 chunk，以便让 GPU 始终运行在接近计算饱和的状态。因此，TetriInfer 论文中也提出了基于块级的 KV cache 传输方案。
 
-## 6 vLLM 的 PD 分离
+## 6vLLM 的 PD 分离
 
 vLLM 提供了 **KV Connector** 作为管理实例间 KV cache 交换的抽象层，它提供统一接口来实现 KV cache 的保存、加载与传输，使不同的 vLLM 实例（如 prefill 与 decode 实例）能够高效共享计算结果。通过实现这一接口，各类 connector（例如通过文件系统的 SharedStorageConnector、通过网络的 NixlConnector 等）提供了灵活的 KV cache 传输方案，从而支持 PD 分离等高级功能。
 
@@ -342,7 +335,7 @@ AIBrix 是字节跳动开源的云原生分布式推理框架，专为大规模 
 
 ## 8 Chunked-Prefills VS PD 分离
 
-chunked-prefills 方案的核心思想是：将长序列的 prefill 请求拆分为几乎相等大小的小块，然后构建了由 prefill 小块和 decode 组成的混合 batch。或者说，chunked-prefills 策略通过将不同长度的 prompts 拆分成长度一致的 chunks 来进行 prefill，以避免长 prompt 阻塞其他请求，同时利用这些 chunks 的间隙进行 decode 的插入/捎带（piggyback）操作，从而减少延迟并提高整体的吞吐。
+chunked-prefills 方案的核心思想是：将长序列的预填充请求拆分为几乎相等大小的小块，然后构建了由 prefill 小块和 decode 组成的混合 batch。或者说，chunked-prefills 策略通过将不同长度的 prompts 拆分成长度一致的 chunks 来进行 prefill，以避免长 prompt 阻塞其他请求，同时利用这些 chunks 的间隙进行 decode 的插入/捎带（piggyback）操作，从而减少延迟并提高整体的吞吐。
 
 decode 阶段的开销不仅来自从 GPU 内存中获取 KV cache，还包括提取模型参数。而通过这种 piggyback 方法，decode 阶段能够重用 prefill 时已提取的模型参数，几乎将 decode 阶段从一个以内存为主的操作转变为一个计算为主的操作。因此，这样构建的混合批次具有近乎均匀的计算需求（而且增加了计算密集性），使我们能够创建平衡的微批处理调度，缓解了迭代之间的不平衡，导致 GPU 的管道气泡最小化，提高了 GPU 的利用率。也最小化了计算新 prefill 对正在进行的 decode 的 TBT 的影响，从而实现了高吞吐量和低 TBT 延迟。
 
@@ -367,8 +360,6 @@ chunked-prefills 有两个明显的好处：
 - [Mooncake: A KVCache-centric Disaggregated Architecture for LLM Serving](https://arxiv.org/abs/2407.00079)
 
 ## 10 总结
-
-PD 分离大模型推理中的一种架构优化策略，核心思想是把 prefill 阶段和 decode 阶段分开，由不同的 GPU 或实例分别承担。通过分离架构，系统可以针对 prefill（计算密集型）和 decode（内存密集型）的不同特性分别优化资源配置和并行策略，从而在满足 TTFT 和 TPOT SLO 约束的前提下显著提升有效吞吐量（Goodput）。虽然 PD 分离需要在 GPU 间传输 KV Cache，但通过高速互联网络和优化的传输策略，这一开销可以被有效隐藏。目前，vLLM、Mooncake、Dynamo 等主流推理框架都已支持 PD 分离，为大规模 LLM 服务提供了更高效的解决方案。相比于 chunked-prefills 等替代方案，PD 分离在需要同时满足严格 TTFT 和 TPOT 要求的场景下具有明显优势。
 
 ## 11 参考资料
 
