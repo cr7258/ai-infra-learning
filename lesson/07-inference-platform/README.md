@@ -1,0 +1,853 @@
+# Inference Platform
+
+## NVIDIA Dynamo
+
+安装 Dynamo 可以参考 [Deploying Dynamo on Kubernetes](https://github.com/ai-dynamo/dynamo/blob/main/docs/kubernetes/README.md)。
+
+### 使用 DynamoGraphDeployment 部署推理服务
+
+```yaml
+apiVersion: nvidia.com/v1alpha1
+kind: DynamoGraphDeployment
+metadata:
+  name: vllm-agg
+spec:
+  services:
+    Frontend:
+      dynamoNamespace: vllm-agg
+      componentType: frontend
+      replicas: 1
+      extraPodSpec:
+        mainContainer:
+          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:0.7.1
+    VllmDecodeWorker:
+      envFromSecret: hf-token-secret
+      dynamoNamespace: vllm-agg
+      componentType: worker
+      replicas: 1
+      resources:
+        limits:
+          gpu: "1"
+      extraPodSpec:
+        mainContainer:
+          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:0.7.1
+          workingDir: /workspace/examples/backends/vllm
+          command:
+            - python3
+            - -m
+            - dynamo.vllm
+          args:
+            - --model
+            - Qwen/Qwen3-0.6B
+```
+
+### PD 分离
+
+当 Decode Worker 收到请求后，首先判断 Prefill 应该在本地还是远程执行，并分配 KV Blocks。如果选择远程执行，则将 Remote Prefill 请求推送到 Prefill Queue（基于 NATS）。Prefill Worker 从队列拉取请求，通过 NIXL 从 Decode Worker 读取 Prefix Cache 命中的 KV Blocks，执行 Prefill 计算后，再通过 NIXL 将计算后的 KV Blocks 写回 Decode Worker。最后 Decode Worker 收到完成通知后执行剩余的 Decode。
+
+![](https://chengzw258.oss-cn-beijing.aliyuncs.com/Article/20260104130437710.png)
+
+以下是 PD 分离的 DynamoGraphDeployment 配置示例：
+
+```yaml
+apiVersion: nvidia.com/v1alpha1
+kind: DynamoGraphDeployment
+metadata:
+  name: vllm-disagg
+spec:
+  services:
+    Frontend:
+      dynamoNamespace: vllm-disagg
+      componentType: frontend
+      replicas: 1
+      extraPodSpec:
+        mainContainer:
+          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:0.7.1
+    VllmDecodeWorker:
+      dynamoNamespace: vllm-disagg
+      envFromSecret: hf-token-secret
+      componentType: worker
+      subComponentType: decode
+      replicas: 1
+      resources:
+        limits:
+          gpu: "1"
+      extraPodSpec:
+        mainContainer:
+          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:0.7.1
+          workingDir: /workspace/examples/backends/vllm
+          command:
+          - python3
+          - -m
+          - dynamo.vllm
+          args:
+            - --model
+            - Qwen/Qwen3-0.6B
+            - --is-decode-worker
+    VllmPrefillWorker:
+      dynamoNamespace: vllm-disagg
+      envFromSecret: hf-token-secret
+      componentType: worker
+      subComponentType: prefill
+      replicas: 1
+      resources:
+        limits:
+          gpu: "1"
+      extraPodSpec:
+        mainContainer:
+          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:my-tag
+          workingDir: /workspace/examples/backends/vllm
+          command:
+          - python3
+          - -m
+          - dynamo.vllm
+          args:
+            - --model
+            - Qwen/Qwen3-0.6B
+            - --is-prefill-worker
+```
+
+### Prefix Cache Aware Routing
+
+Dynamo KV Router 通过评估请求在不同 Worker 上的计算成本来智能路由请求，综合考虑 Decode 成本（来自活跃 Blocks）和 Prefill 成本（来自新计算的 Blocks），在最大化 Prefix Cache 命中率的同时保持负载均衡。
+
+![](https://chengzw258.oss-cn-beijing.aliyuncs.com/Article/20260104173728740.png)
+
+#### 路由计算公式
+
+```
+logit = kv_overlap_score_weight × potential_prefill_blocks + potential_active_blocks
+```
+
+- **logit**：值越低越好（计算成本越低）
+- **potential_prefill_blocks**：需要计算的 Prefill Block 数量（KV Cache 匹配越长，需要计算的越少）
+- **potential_active_blocks**：当前正在处理请求的 Block 数量，反映 Worker 负载
+- **kv_overlap_score_weight**（默认 1.0）：
+  - `> 1.0`：注重 TTFT，优先选择 KV Cache 匹配长的 Worker
+  - `< 1.0`：注重 ITL，优先选择负载低的 Worker
+
+#### 路由模式
+
+Prefix Cache Aware Routing 可分为**精确模式**和**近似模式**两种：
+
+1. **精确模式**：Worker 上报 KV 事件，Router 维护准确的全局 Cache 状态
+   - **JetStream（默认）**：事件发送到持久化的 NATS JetStream，支持多副本一致性和重启恢复。适用于生产环境。
+
+   ![](https://chengzw258.oss-cn-beijing.aliyuncs.com/Article/20260104132451647.png)
+
+   - **NATS Core + Local Indexer**：Worker 使用 `--enable-local-indexer` 维护本地 Radix Tree，通过 NATS Core 发布事件。适用于低延迟、简单部署。
+
+   ![](https://chengzw258.oss-cn-beijing.aliyuncs.com/Article/20260104132504384.png)
+
+2. **近似模式**（`--no-kv-events`）：禁用 KV 事件追踪。默认情况下（不提供此标志时），Router 使用 KV 事件监控 Worker 的 Block 创建和删除。启用此标志后，Router 将根据路由决策并结合基于 TTL 的过期（默认 120 秒）和修剪来预测缓存状态。如果你的 Backend 不支持 KV 事件（或对事件的准确性或响应性没有信心），请使用此标志。
+
+#### 配置示例
+
+以下是启用 KV Router 的 DynamoGraphDeployment 配置示例：
+
+```yaml
+apiVersion: nvidia.com/v1alpha1
+kind: DynamoGraphDeployment
+metadata:
+  name: my-deployment
+spec:
+  services:
+    Frontend:
+      dynamoNamespace: my-namespace
+      componentType: frontend
+      replicas: 1
+      envs:
+        - name: DYN_ROUTER_MODE
+          value: kv  # 启用 KV Cache Aware Routing
+        - name: DYN_ROUTER_TEMPERATURE
+          value: "0.5"  # 增加随机性防止 Worker 饱和
+        - name: DYN_KV_OVERLAP_SCORE_WEIGHT
+          value: "1.5"  # 优先 TTFT 而非 ITL
+        - name: DYN_KV_CACHE_BLOCK_SIZE
+          value: "16"
+      extraPodSpec:
+        mainContainer:
+          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:0.6.0
+```
+
+参考资料：
+- [KV Cache Routing](https://github.com/ai-dynamo/dynamo/blob/main/docs/router/kv_cache_routing.md)
+- [KV Router Overview](https://github.com/ai-dynamo/dynamo/blob/main/docs/router/README.md)
+
+### SLA Planner
+
+SLA Planner 是 Dynamo 的智能自动扩缩容系统，使用**预测建模**和**性能插值**来主动调整 Prefill 和 Decode Worker 数量，确保推理服务满足指定的 TTFT 和 ITL 目标。
+
+SLA Planner 由以下几个关键组件构成：
+
+1. **Load Predictors**：预测未来的请求模式（请求数量、输入/输出序列长度）
+2. **Performance Interpolators**：基于 Profiling 性能数据估算 TTFT 和 ITL
+3. **Correction Factors**：根据观测值与预期值的偏差调整预测
+4. **Scaling Logic**：计算最优的 Prefill/Decode 副本数以满足 SLA 目标
+
+#### 扩缩容算法
+
+SLA Planner 使用复杂的扩缩容算法。在每个调整间隔，SLA Planner 执行以下操作：
+
+**1. 指标收集**
+
+每个调整间隔收集：
+- 平均 Time to First Token (TTFT)
+- 平均 Inter-Token Latency (ITL)
+- 请求数量和持续时间
+- 输入/输出序列长度
+
+**2. 校正因子计算**
+
+使用收集的指标，SLA Planner 应用 Interpolator 找出预期的 TTFT/ITL 并校准插值模型。这一步很重要，因为实际的 TTFT/ITL 通常与理想情况不同：
+- **TTFT**：实际 TTFT 严重依赖于请求排队和 Prefix Cache 命中率（如果使用 KV 复用）。例如，如果所有请求都在调整间隔开始时到达，由于当前 Worker 数量是基于上一周期的负载预测的，Planner 还没来得及扩容，请求只能排队等待，TTFT 会显著更高。如果 Prefix Cache 命中率很高，Prefill 中的实际 token 数量会很低，TTFT 会显著更低。
+- **ITL**：实际 ITL 可能受 Decode 引擎中 Chunked 小 Prefill 请求的影响。
+- **指标方差**：请求率、ISL 和 OSL 的大方差可能导致 TTFT/ITL 估计不准确，因为 SLA 在插值时只考虑平均值。
+
+SLA Planner 计算校正因子：
+- **Prefill correction**：`actual_ttft / expected_ttft`
+- **Decode correction**：`actual_itl / expected_itl`
+
+**3. 负载预测**
+
+SLA Planner 使用 Load Predictor 预测下一个调整间隔的请求数量、ISL 和 OSL。目前支持三种负载预测模型：
+
+| Predictor | 适用场景 | 行为 | 配置 |
+|-----------|----------|------|------|
+| **Constant** | 稳定负载和长预测周期 | 假设下一周期负载等于当前负载 | `load-predictor: "constant"` |
+| **ARIMA** | 具有趋势和季节性的时间序列数据 | 使用 auto-ARIMA 拟合最优模型参数 | `load-predictor: "arima"` |
+| **Prophet** | 复杂的季节性模式和趋势变化 | Facebook 的 [Prophet](https://facebook.github.io/prophet/) 时间序列预测模型 | `load-predictor: "prophet"` |
+
+**4. 计算所需副本数**
+
+**Prefill 副本数**：SLA Planner 假设 Prefill 校正因子对每 GPU 的 Prefill 吞吐量有线性影响，因为 Prefill 是单批处理的。
+
+```
+predicted_load = next_requests * next_isl / interval * min(1, prefill_correction)
+prefill_replicas = ceil(predicted_load / interpolated_throughput / gpus_per_engine)
+```
+
+计算逻辑：
+1. `predicted_load`：预测的 Prefill 负载 = 预测请求数 × 预测 ISL / 调整间隔 × 校正因子（上限为 1）
+2. `prefill_replicas`：所需副本数 = 预测负载 / 每 GPU 插值吞吐量 / 每实例 GPU 数，向上取整
+
+**Decode 副本数**：与 Prefill 不同，Decode 是显存带宽密集型操作，使用 Continuous Batching 多请求共享 GPU。ITL 受 KV Cache 占用率和 Context Length 双重影响，因此需要通过 2D 插值反向查找满足 ITL 目标的吞吐量，且校正因子应用于 ITL 目标而非负载。
+
+```python
+# 1. 将 d_correction_factor 应用到 ITL SLA
+corrected_itl = self.args.itl / self.d_correction_factor
+# 2. 反向查找在预测的 context length 下能达到 corrected_itl 的最佳吞吐量/GPU
+pred_decode_thpt_per_gpu = self.decode_interpolator.find_best_throughput_per_gpu(
+    itl=corrected_itl,
+    context_length=next_isl + next_osl / 2
+)
+# 3. 计算所需的 decode 副本数
+next_num_d = math.ceil(next_num_req * next_osl / self.args.adjustment_interval / pred_decode_thpt_per_gpu / self.args.decode_engine_num_gpu)
+```
+
+计算逻辑：
+1. `corrected_itl`：校正后的 ITL 目标 = ITL SLA 目标 / Decode 校正因子（如果实际 ITL 比预期高，校正因子 > 1，则降低 ITL 目标以补偿）
+2. `pred_decode_thpt_per_gpu`：通过 Interpolator 反向查找，在预测的平均 context length（ISL + OSL/2）下，能满足校正后 ITL 目标的最大吞吐量/GPU
+3. `next_num_d`：所需副本数 = 预测请求数 × 预测 OSL / 调整间隔 / 每 GPU 吞吐量 / 每实例 GPU 数，向上取整
+
+**5. 执行扩缩容**
+
+最后，SLA Planner 通过扩缩容 Prefill 和 Decode Worker 数量到计算出的副本数来应用变更。
+
+#### 使用 DynamoGraphDeploymentRequest 进行 SLA 的性能分析
+
+SLA Planner 要求在部署前完成 Profiling。Profiling 过程分析模型的性能特征，确定最优的并行配置和 Planner 运行时使用的扩缩容参数。
+
+你可以使用 DynamoGraphDeploymentRequest (DGDR) 来部署满足 SLA 优化的 Dynamo DynamoGraphDeploymentRequest 工作流自动化从 SLA 定义到部署的全过程：
+
+1. **定义 SLA**：在 DynamoGraphDeploymentRequest 中指定性能需求（TTFT、ITL）和模型信息。
+2. **自动 Profiling**：Dynamo Operator 自动对模型进行性能分析，找到最优配置。
+3. **自动部署**：Profiling 完成后，系统自动创建并部署满足 SLA 的 DynamoGraphDeployment（包含最优并行配置和 Planner 组件）和 `planner-profile-data` ConfigMap（性能插值数据）。
+
+DynamoGraphDeploymentRequest 支持两种性能分析方式：
+- **Online Profiling (AIPerf)**：在 Kubernetes 中部署真实推理实例进行性能分析，耗时 2-4 小时，精度最高，支持 vLLM、SGLang、TensorRT-LLM。
+- **Offline Profiling (AI Configurator)**：使用性能模拟器快速估算，仅需 20-30 秒，目前仅支持 TensorRT-LLM。
+
+```mermaid
+flowchart TD
+    A[Create DGDR] --> B[DGDR Controller]
+    B --> C{Profiling Method}
+    C -->|Online| D[Run Profiling Job<br/>2-4 hours]
+    C -->|Offline/AIC| E[AI Configurator<br/>20-30 seconds]
+    D --> F[Generate DGD Config]
+    E --> F
+    F --> G[Auto-Deploy DGD]
+    G --> H[Monitor & Scale]
+
+    style A fill:#e1f5fe
+    style D fill:#fff3e0
+    style E fill:#e8f5e8
+    style G fill:#f3e5f5
+    style H fill:#fff8e1
+```
+
+##### 在线性能分析
+
+通过在 Kubernetes 中创建真实的测试部署并测量性能。耗时 2-4 小时，精度最高，支持 vLLM、SGLang、TensorRT-LLM。
+
+```yaml
+apiVersion: nvidia.com/v1alpha1
+kind: DynamoGraphDeploymentRequest
+metadata:
+  name: vllm-dense-online
+spec:
+  model: "Qwen/Qwen3-0.6B"        # 模型名称
+  backend: vllm                    # 推理后端：vllm / sglang / trtllm
+
+  profilingConfig:
+    profilerImage: "nvcr.io/nvidia/ai-dynamo/vllm-runtime:0.7.1"  # Profiling 使用的镜像
+    config:
+      sla:                         # SLA 
+        isl: 3000                  # 输入序列长度
+        osl: 150                   # 输出序列长度
+        ttft: 200.0                # 首 Token 延迟目标 (ms)
+        itl: 20.0                  # Token 间延迟目标 (ms)
+
+      hardware:                    # 硬件配置
+        min_num_gpus_per_engine: 2      # 每实例最小 GPU 数（未指定时根据模型和显存自动确定）
+        max_num_gpus_per_engine: 8      # 每实例最大 GPU 数
+        num_gpus_per_node: 8            # 每节点 GPU 数（用于多节点 MoE）
+        gpu_type: h200_sxm              # GPU 类型
+
+      sweep:
+        use_ai_configurator: false # 在线性能分析
+
+  deploymentOverrides:
+    workersImage: "nvcr.io/nvidia/ai-dynamo/vllm-runtime:0.7.1"  # 部署时使用的镜像
+
+  autoApply: true                  # Profiling 完成后自动部署 DynamoGraphDeployment
+```
+
+##### 使用 AI Configurator 离线模拟分析
+
+使用性能模拟快速估算最优配置，无需运行真实部署。耗时仅 20-30 秒，目前仅支持 TensorRT-LLM。
+
+```yaml
+apiVersion: nvidia.com/v1alpha1
+kind: DynamoGraphDeploymentRequest
+metadata:
+  name: trtllm-aic-offline
+spec:
+  model: "Qwen/Qwen3-32B"
+  backend: trtllm
+
+  profilingConfig:
+    profilerImage: "nvcr.io/nvidia/ai-dynamo/tensorrtllm-runtime:0.6.1"
+    config:
+      sla:
+        isl: 4000
+        osl: 500
+        ttft: 300.0
+        itl: 10.0
+
+      sweep:
+        use_ai_configurator: true # 使用 AI Configurator 离线模拟
+
+      aic:
+        system: h200_sxm
+        model_name: QWEN3_32B
+        backend_version: "0.20.0"
+
+  deploymentOverrides:
+    workersImage: "nvcr.io/nvidia/ai-dynamo/tensorrtllm-runtime:0.6.1"
+
+  autoApply: true
+```
+
+参考资料：
+
+- [SLA-Driven Profiling and Planner Deployment Quick Start Guide](https://github.com/ai-dynamo/dynamo/blob/v0.7.1/docs/planner/sla_planner_quickstart.md)
+- [SLA-Driven Profiling with DynamoGraphDeploymentRequest](https://github.com/ai-dynamo/dynamo/blob/v0.7.1/docs/benchmarks/sla_driven_profiling.md)
+- [SLA-based Planner](https://github.com/ai-dynamo/dynamo/blob/v0.7.1/docs/planner/sla_planner.md)
+
+### KVBM (KV Block Manager)
+
+Dynamo KV Block Manager (KVBM) 是一个可扩展的运行时组件，用于处理跨异构和分布式环境的推理任务中 Key-Value (KV) Block 的内存分配、管理和远程共享。它作为 vLLM、SGLang 和 TRT-LLM 等框架的统一内存层。KVBM 提供：
+
+- **统一内存 API**：跨 GPU 显存（未来）、锁页主机内存、RDMA 可访问远程内存、本地/分布式 SSD 池和远程文件/对象/云存储系统。
+- **Block 生命周期管理**：支持 allocate → register → match 的状态转换，存储后端可订阅基于事件的状态变化。
+- **NIXL 集成**：通过 RDMA/NVLink 进行远程内存块的注册、共享和访问。
+
+![](https://chengzw258.oss-cn-beijing.aliyuncs.com/Article/20260103221510630.png)
+
+#### KVBM 内存层级
+
+KVBM 跨多个内存层级协调 KV Block：GPU 显存 (G1)、本地/跨节点 CPU 内存 (G2)、本地/池化 SSD (G3) 和远程存储 (G4)。需要注意的是，KVBM 将 G4 存储视为不透明的 Blob 存储，不感知其内部布局优化。
+
+![](https://chengzw258.oss-cn-beijing.aliyuncs.com/Article/20260103221456815.png)
+
+#### KV Cache Offloading 场景
+
+当 KV Cache 超出 GPU 显存且缓存复用收益大于数据传输开销时，将 KV Cache Offload 到 CPU 或存储最为有效。在长上下文、高并发或资源受限的推理环境中尤其有价值：
+
+- **长会话和多轮对话**：Offloading 保留大型 Prompt 前缀，避免重计算，改善首 Token 延迟和吞吐量。
+- **高并发（未来）**：空闲或部分会话可移出 GPU 显存，让活跃请求继续处理而不触及内存限制。
+- **共享或重复内容（未来）**：跨用户/会话复用（如系统 Prompt 和模板）提高缓存命中率，尤其在远程或跨实例共享场景。
+- **内存或成本受限部署**：Offloading 到 RAM 或 SSD 降低 GPU 需求，允许更长的 Prompt 或更多用户而无需增加硬件。
+
+#### 使用 KVBM
+
+```yaml
+apiVersion: nvidia.com/v1alpha1
+kind: DynamoGraphDeployment
+metadata:
+  name: vllm-disagg-kvbm
+spec:
+  services:
+    Frontend:
+      dynamoNamespace: vllm-disagg-kvbm
+      componentType: frontend
+      replicas: 1
+      extraPodSpec:
+        mainContainer:
+          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:0.7.1
+    VllmDecodeWorker:                          # Decode Worker 不需要 KVBM
+      dynamoNamespace: vllm-disagg-kvbm
+      envFromSecret: hf-token-secret
+      componentType: worker
+      replicas: 1
+      resources:
+        limits:
+          gpu: "1"
+      extraPodSpec:
+        mainContainer:
+          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:0.7.1
+          workingDir: /workspace/examples/backends/vllm
+          command:
+          - python3
+          - -m
+          - dynamo.vllm
+          args:
+            - --model
+            - Qwen/Qwen3-8B
+            - --max-model-len
+            - "32000"
+            - --enforce-eager
+    VllmPrefillWorker:                         # Prefill Worker 启用 KVBM
+      dynamoNamespace: vllm-disagg-kvbm
+      envFromSecret: hf-token-secret
+      componentType: worker
+      replicas: 1
+      resources:
+        requests:
+          gpu: "1"
+          memory: "200Gi"                      # KVBM 需要大量 CPU 内存
+        limits:
+          gpu: "1"
+          memory: "250Gi"
+      envs:
+        - name: DYN_KVBM_CPU_CACHE_GB          # 配置 CPU 缓存大小
+          value: "100"                         # 100GB CPU 内存用于 KV Cache
+      extraPodSpec:
+        mainContainer:
+          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:0.7.1
+          workingDir: /workspace/examples/backends/vllm
+          command:
+          - python3
+          - -m
+          - dynamo.vllm
+          args:
+            - --model
+            - Qwen/Qwen3-8B
+            - --is-prefill-worker
+            - --max-model-len
+            - "32000"
+            - --enforce-eager
+            - --connector
+            - kvbm                             # 启用 KVBM connector
+            - nixl                             # P/D 分离需要 NIXL 传输
+```
+
+参考资料：
+
+- [KV Block Manager](https://github.com/ai-dynamo/dynamo/blob/main/docs/kvbm/kvbm_intro.rst)
+- [Motivation behind KVBM](https://github.com/ai-dynamo/dynamo/blob/main/docs/kvbm/kvbm_motivation.md)
+
+### NIXL (NVIDIA Inference tranXfer Library)
+
+高性能 P/D 分离的关键是高效的 KV 传输。Dynamo 利用 NIXL 将 KV Cache 直接从 Prefill 实例的显存传输到 Decode 实例的显存。此外，KV 传输是非阻塞的，允许 GPU 在 KV 传输的同时继续执行其他请求的前向传播。
+
+![](https://chengzw258.oss-cn-beijing.aliyuncs.com/Article/20260103222136340.png)
+
+#### NIXL 支持的后端
+
+NIXL 支持多种后端：
+
+- 块存储（GPU HBM、Host DRAM、Remote DRAM、Local SSD）
+- 本地文件系统（POSIX）
+- 远程文件系统（NFS）
+- 对象存储（S3 兼容）
+- 云存储（Blob Storage API）
+
+#### 元数据优化
+
+为了减少内存描述符的大小，Dynamo 采用了两项优化：
+
+1. **ETCD 元数据存储**：每个 Worker 完成初始化并分配所有 KV Cache 池后，将所有 Block 的内存描述符（也称为 NIXL 元数据）存储到 ETCD（分布式键值存储）中。Prefill Worker 在首次处理某个 Worker 发起的远程 Prefill 请求时，加载并缓存该 Worker 的内存描述符。因此，发起远程 Prefill 请求时只需传递 KV Block ID，而非完整的内存描述符。
+
+2. **连续块合并**：Dynamo 优化 Prefill 实例中的内存分配器，分配连续的块并将连续块合并为更大的块，以减少 KV Block 的总数。
+
+#### KV 布局转置
+
+对于使用不同 TP 配置的 Decode 和 Prefill，KV 布局会不同。Dynamo 在 NIXL 读取之后、写入之前，使用高性能 kernel 将 KV Block 转置为接收方匹配的布局。
+
+参考资料：
+
+- [NIXL GitHub](https://github.com/ai-dynamo/nixl)
+- [Dynamo Disaggregation: Separating Prefill and Decode for Enhanced Performance](https://github.com/ai-dynamo/dynamo/blob/main/docs/design_docs/disagg_serving.md)
+- [KVBM components](https://github.com/ai-dynamo/dynamo/blob/main/docs/kvbm/kvbm_design_deepdive.md)
+
+### Fault Tolerance（容错机制）
+
+Dynamo 的容错机制包含两个核心部分：**Request Migration（请求迁移）** 和 **Request Cancellation（请求取消）**。
+
+#### Request Migration（请求迁移）
+
+Request Migration 允许正在进行的请求在原始 Worker 不可用时迁移到其他 Worker 继续执行，实现故障容错和无缝用户体验。
+
+![](https://chengzw258.oss-cn-beijing.aliyuncs.com/Article/20260104125143571.png)
+
+**两种迁移场景**：
+
+1. **New Request Migration（初始连接失败）**：Worker 在建立初始连接时不可达，系统检测到连接失败后递减重试计数，使用原始请求尝试连接其他 Worker。由于生成尚未开始，无需保存部分状态。
+
+2. **Ongoing Request Migration（中途断连）**：生成过程中连接断开。系统检测到 Stream 终止后，保留已累积的 token 序列（包含原始 prompt 和已生成的所有 token），使用累积状态在新 Worker 上重建 Stream，从断点继续生成。
+
+**配置**：使用 `--migration-limit` 参数指定最大迁移次数（默认为 0，即禁用迁移）。
+
+#### Request Cancellation（请求取消）
+
+Request Cancellation 允许取消正在进行的请求，节省计算资源。使用 HTTP 接口时，如果客户端断开连接，Dynamo 会自动取消发送给 Worker 的下游请求，确保计算资源不会浪费在不再需要的响应生成上。
+
+![](https://chengzw258.oss-cn-beijing.aliyuncs.com/Article/20260104125240424.png)
+
+参考资料：
+
+- [Request Migration Architecture](https://github.com/ai-dynamo/dynamo/blob/main/docs/fault_tolerance/request_migration.md)
+- [Request Cancellation Architecture](https://github.com/ai-dynamo/dynamo/blob/main/docs/fault_tolerance/request_cancellation.md)
+- [Inference Office Hours: Building Fault Tolerance in Systems of Scale for LLM inference](https://www.youtube.com/watch?v=_P-JY65_W78)
+
+### 多节点部署
+
+多节点部署允许将计算密集型 LLM 工作负载扩展到多台物理机器上，最大化 GPU 利用率并支持更大的模型。
+
+#### 多节点编排方案
+
+Dynamo 支持两种多节点编排方案：
+
+1. **Grove + KAI-Scheduler（默认）**
+   - [Grove](https://github.com/NVIDIA/grove)：Grove 提供单一声明式接口编排 AI 推理工作负载，从简单单 Pod 部署到复杂多节点 P/D 分离系统。Grove 支持从单副本扩展到数据中心规模（数万 GPU），提供多级自动扩缩容和显式启动顺序。
+   - [KAI-Scheduler](https://github.com/NVIDIA/KAI-Scheduler)：KAI-Scheduler 是一个强大、高效且可扩展的 Kubernetes 调度器，旨在为 AI 和机器学习工作负载优化 GPU 资源分配。KAI-Scheduler 支持 Gang 调度、拓扑感知放置，管理大规模 GPU 集群（数千节点），在确保不同使用者之间资源公平性的同时实现资源的最佳分配。
+
+![](https://chengzw258.oss-cn-beijing.aliyuncs.com/Article/20260104173026254.png)
+
+2. **LWS + Volcano**
+   - [LWS](https://github.com/kubernetes-sigs/lws)：简单的多节点部署机制，允许跨多个节点部署工作负载
+   - [Volcano](https://volcano.sh/)：针对 AI 工作负载优化的 Kubernetes 原生调度器，与 LWS 配合提供 Gang 调度支持
+
+当两者都可用时，Grove 默认被选中（推荐用于高级 AI 工作负载）。可通过 `nvidia.com/enable-grove: "false"` 注解强制使用 LWS。
+
+#### DynamoGraphDeployment 配置
+
+通过 `multinode` 字段配置多节点部署：
+
+```yaml
+apiVersion: nvidia.com/v1alpha1
+kind: DynamoGraphDeployment
+metadata:
+  name: my-multinode-deployment
+spec:
+  services:
+    my-service:
+      multinode:             # 多节点配置
+        nodeCount: 2         # 节点数量
+      resources:
+        limits:
+          gpu: "4"           # 每节点 GPU 数量
+      extraPodSpec:
+        mainContainer:
+          args:
+            - "--tp-size"
+            - "8"            # 必须等于 nodeCount × gpu
+```
+
+**GPU 分配关系**：`总 GPU 数 = multinode.nodeCount × gpu`
+
+#### 自动注入分布式参数
+
+Dynamo Operator 会根据 Backend 自动注入分布式执行参数：
+
+**vLLM（使用 Ray）**：
+- Leader 节点：`ray start --head --port=6379 && <vllm-command> --distributed-executor-backend ray`
+- Worker 节点：`ray start --address=<leader-hostname>:6379 --block`
+
+**SGLang**：
+- 自动注入：`--dist-init-addr <leader-hostname>:29500 --nnodes <count> --node-rank <rank>`
+
+**TensorRT-LLM（使用 MPI）**：
+- 自动配置 SSH 密钥和 `mpirun` 命令
+
+参考资料：
+- [Multinode Deployment Guide](https://github.com/ai-dynamo/dynamo/blob/main/docs/kubernetes/deployment/multinode-deployment.md)
+
+### 模型管理
+
+Dynamo 通过 `DynamoModel` CRD 实现动态模型管理，主要用于在运行中的推理服务上动态加载/卸载 LoRA Adapter，无需重启 Pod。
+
+#### 工作流程
+
+创建 DynamoModel 时，Dynamo Operator 会执行以下操作：
+
+1. **发现端点**：通过匹配 DynamoGraphDeployment 中的 `modelRef.name` 找到所有运行 `baseModelName` 的 Pod。
+2. **创建 Service**：自动创建 Kubernetes Service 来追踪这些 Pod。
+3. **加载 LoRA**：对每个端点调用 LoRA 加载 API（仅 `lora` 类型）。
+4. **更新状态**：报告哪些端点已就绪。
+
+#### 配置示例
+
+```yaml
+# 1. 部署基础模型
+apiVersion: nvidia.com/v1alpha1
+kind: DynamoGraphDeployment
+metadata:
+  name: my-deployment
+spec:
+  services:
+    Worker:
+      modelRef:
+        name: Qwen/Qwen3-0.6B       # 关联 DynamoModel
+      componentType: worker
+      replicas: 2
+      resources:
+        limits:
+          gpu: "1"
+      extraPodSpec:
+        mainContainer:
+          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:0.7.1
+          args:
+            - --model
+            - Qwen/Qwen3-0.6B
+            - --enable-lora          # 启用 LoRA
+            - --max-lora-rank
+            - "64"
+---
+# 2. 部署 LoRA Adapter
+apiVersion: nvidia.com/v1alpha1
+kind: DynamoModel
+metadata:
+  name: my-lora
+spec:
+  modelName: my-custom-lora          # LoRA 模型标识符
+  baseModelName: Qwen/Qwen3-0.6B     # 必须匹配 DGD 中的 modelRef.name
+  modelType: lora
+  source:
+    uri: s3://my-bucket/loras/my-lora  # 支持 s3:// 或 hf://
+```
+
+#### 多 LoRA 场景
+
+同一基础模型可加载多个 LoRA Adapter：
+
+```yaml
+# LoRA 1: 客服场景
+apiVersion: nvidia.com/v1alpha1
+kind: DynamoModel
+metadata:
+  name: support-lora
+spec:
+  modelName: support-adapter
+  baseModelName: Qwen/Qwen3-0.6B
+  modelType: lora
+  source:
+    uri: s3://models/support-lora
+---
+# LoRA 2: 代码场景
+apiVersion: nvidia.com/v1alpha1
+kind: DynamoModel
+metadata:
+  name: code-lora
+spec:
+  modelName: code-adapter
+  baseModelName: Qwen/Qwen3-0.6B    # 同一基础模型
+  modelType: lora
+  source:
+    uri: s3://models/code-lora
+```
+
+请求时通过 `model` 字段指定使用哪个 LoRA：
+
+```bash
+curl -X POST http://localhost:8000/v1/completions \
+  -d '{"model": "support-adapter", "prompt": "Hello"}'
+```
+
+参考资料：
+- [Managing Models with DynamoModel](https://github.com/ai-dynamo/dynamo/blob/main/docs/kubernetes/deployment/dynamomodel-guide.md)
+
+## llm-d
+
+llm-d 是一个可扩展的架构，旨在跨模型服务 Pod 高效路由推理请求。该架构的核心组件是 Inference Gateway，它基于 Kubernetes 原生的 Gateway API Inference Extension 构建，实现可扩展、灵活且可插拔的请求路由。
+
+### Inference Scheduler
+
+[Inference Scheduler](https://github.com/llm-d/llm-d-inference-scheduler) 为 llm-d 推理框架提供 Endpoint Picker (EPP) 组件，为推理请求做出优化的路由决策。
+
+EPP 扩展了 [Gateway API Inference Extension (GIE)](https://gateway-api-inference-extension.sigs.k8s.io/) 项目，该项目提供调度所需的 API 资源和机制。llm-d 在此基础上添加了特定功能，如 P/D 分离。两个项目紧密协作，llm-d 中的功能通常需要在 GIE 代码库中进行支持和扩展。独特的实验性功能可能先在 llm-d 中实现，随着时间推移迁移到 GIE。
+
+#### EPP 配置示例
+
+EPP 配置主要由 `plugins` 和 `schedulingProfiles` 组成：
+- **plugins**：定义可用的插件实例及其参数。
+- **schedulingProfiles**：定义调度配置文件，指定请求处理时使用哪些插件。
+
+路由决策通过可插拔组件实现：
+- **Filter**：根据条件排除 Pod（如 `decode-filter` 仅保留 Decode 角色的 Pod）。
+- **Scorer**：为候选 Pod 评分（如 `prefix-cache-scorer` 基于 KV Cache 命中率评分），通过 `weight` 指定权重。
+
+```yaml
+apiVersion: inference.networking.x-k8s.io/v1alpha1
+kind: EndpointPickerConfig
+plugins:
+- type: prefix-cache-scorer
+  parameters:
+    hashBlockSize: 5
+    maxPrefixBlocksToMatch: 256
+    lruCapacityPerServer: 31250
+- type: decode-filter
+- type: max-score-picker
+- type: single-profile-handler
+schedulingProfiles:
+- name: default
+  plugins:
+  - pluginRef: decode-filter
+  - pluginRef: max-score-picker
+  - pluginRef: prefix-cache-scorer
+    weight: 50
+```
+
+#### 请求流程
+
+一次请求的流程如下：
+
+- Client 发送请求（如 `/v1/completions`）到 Gateway（Envoy）。
+- Gateway 匹配 HTTPRoute 并选择对应的 InferencePool。
+- Gateway 通过 ext-proc 询问 EPP 应该路由到哪个 Pod，EPP 内部执行 Filter → Score → Pick 流程。
+- EPP 返回选中的 Pod。
+- Gateway 将请求转发到选中的 Pod。
+
+EPP 会周期性地从 InferencePool 中的 Pod 抓取 metrics，用于评分决策。
+
+![](https://chengzw258.oss-cn-beijing.aliyuncs.com/Article/20260104182215195.png)
+
+### KV-Cache Indexer
+
+[KV-Cache Indexer](https://github.com/llm-d/llm-d-kv-cache) 是一个高性能库，用于维护跨多个 vLLM Pod 的 KV-Cache Block 位置的全局近实时视图。其目的是通过提供基于缓存 KV-Blocks 的快速智能评分机制，实现对 vLLM Pod 的智能路由和调度。
+
+Indexer 由 vLLM 流式传输的 KV Event 驱动——当 KV Block 在 vLLM 实例中创建或驱逐时，会发出结构化元数据事件。Indexer 据此追踪每个 Block 所在的节点和存储层（GPU/CPU），为 KV Cache 感知的路由决策提供依据。
+
+```mermaid
+graph TD
+    subgraph "Inference Scheduler"
+        A[Scheduler]
+
+        subgraph "KV-Cache"
+            B[`kvcache.Indexer`]
+            C[`kvblock.Index`]
+            D[`kvevents.Pool`]
+        end
+    end
+
+    subgraph "vLLM Fleet"
+        E[vLLM Pod 1]
+        F[vLLM Pod 2]
+        G[...]
+    end
+
+    A--"1: Score(prompt, pods)"-->B
+    B--"2: Query Index"-->C
+    B--"3: Return Scores"-->A
+    
+    E--"A: Emit KVEvents"-->D
+    F--"A: Emit KVEvents"-->D
+    D--"B: Update Index"-->C
+```
+
+### PD 分离
+
+请求流程如下：
+1. Client 发送推理请求到 Gateway (Envoy)。
+2. Gateway 将请求转发给 EPP 调度器进行端点选择。
+3. EPP 执行两阶段调度：
+   - 首先，使用 decode profile 选择一个 Decode Pod。
+   - 然后，根据 prompt 长度、prefix cache 命中率和 pdThreshold 判断是否需要 Prefill Pod。
+   - 如果需要，运行 prefill profile 选择 Prefill Pod。
+4. EPP 仅将 Decode Pod 的端点返回给 Gateway，但通过 `prefill-header-handler` 插件将 Prefill Pod 地址（如已选择）注入 HTTP header `x-prefiller-host-port`。
+5. Gateway 将请求转发到 Decode Pod 的 sidecar。
+6. Sidecar 检查 `x-prefiller-host-port` header：
+   - 如果存在，先联系 Prefill Pod 执行 prefill（设置 `max_output_tokens=1`）并获取 KV cache 信息。
+   - 然后将包含 prefill 结果的完整请求转发到本地 Decode Pod。
+7. Decode Pod 生成最终响应，通过 sidecar → gateway → client 返回。
+
+![](https://chengzw258.oss-cn-beijing.aliyuncs.com/Article/20260104183549186.png)
+
+P/D 分离的 EPP 配置示例如下：
+
+```yaml
+apiVersion: inference.networking.x-k8s.io/v1alpha1
+kind: EndpointPickerConfig
+plugins:
+- type: prefill-header-handler        # 注入 x-prefiller-host-port header
+- type: prefix-cache-scorer
+  parameters:
+    hashBlockSize: 5
+    maxPrefixBlocksToMatch: 256
+    lruCapacityPerServer: 31250
+- type: prefill-filter                # Prefill 角色过滤器
+- type: decode-filter                 # Decode 角色过滤器
+- type: max-score-picker
+- type: pd-profile-handler            # P/D 配置文件处理器
+  parameters:
+    threshold: 10                     # pdThreshold，决定是否需要 Prefill
+    hashBlockSize: 5
+schedulingProfiles:
+- name: prefill                       # prefill-profile
+  plugins:
+  - pluginRef: prefill-filter         # 仅保留 Prefill 角色的 Pod
+  - pluginRef: max-score-picker
+  - pluginRef: prefix-cache-scorer
+    weight: 50
+- name: decode                        # decode-profile
+  plugins:
+  - pluginRef: decode-filter          # 仅保留 Decode 角色的 Pod
+  - pluginRef: max-score-picker
+  - pluginRef: prefix-cache-scorer
+    weight: 50
+```
+
+P/D 分离的组件关系如下图所示：
+
+![](https://chengzw258.oss-cn-beijing.aliyuncs.com/Article/20260104181512983.png)
+
+### vLLM Simulator
+
+[vLLM Simulator](https://github.com/llm-d/llm-d-inference-sim) 是一个轻量级 vLLM 模拟器，用于在无需真实 GPU 资源的情况下模拟 vLLM 实例。
+
+**核心功能**：
+- **API 兼容**：实现 `/v1/completions`、`/v1/chat/completions`、`/v1/models` 端点。
+- **Prometheus Metrics**：通过 `/metrics` 端点暴露 vLLM 兼容的指标，包括 `vllm:num_requests_running`、`vllm:e2e_request_latency_seconds`、`vllm:time_to_first_token_seconds` 等。
+- **响应模式**：
+  - Echo 模式：响应返回请求中的相同文本，对于 `/v1/chat/completions` 使用最后一条 `role=user` 的消息。
+  - Random 模式：从预定义的句子集合中随机选择响应。
+- **LoRA 支持**：可模拟 LoRA 适配器的加载/卸载。
+- **P/D 分离**：支持 P/D 分离部署模拟。
+
+**使用场景**：
+- 开发和测试 LLM 推理基础设施。
+- 在 Kind 等环境中进行 Kubernetes 部署测试。
+
+## Kthena
