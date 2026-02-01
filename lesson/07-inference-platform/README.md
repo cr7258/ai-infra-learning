@@ -851,3 +851,284 @@ P/D 分离的组件关系如下图所示：
 - 在 Kind 等环境中进行 Kubernetes 部署测试。
 
 ## Kthena
+
+### 网络拓扑感知调度
+
+在分布式 AI 推理中，节点间的通信延迟直接影响推理效率。通过感知网络拓扑，可以将频繁通信的任务调度到网络距离较近的节点上，从而显著降低通信开销。由于不同网络链路的带宽各异，高效的任务调度能够避免网络拥塞，充分利用高带宽链路，提升整体数据传输效率。
+
+Kthena 利用 Volcano 实现网络拓扑感知调度。为了屏蔽数据中心网络类型的差异，Volcano 定义了一个新的 CRD `HyperNode` 来表示网络拓扑，提供标准化的 API 接口。`HyperNode` 代表一个网络拓扑性能域，通常映射到交换机或 TOR。多个 `HyperNode` 以层级方式连接形成树状结构：
+
+<img src="https://chengzw258.oss-cn-beijing.aliyuncs.com/Article/20260201204437765.png" width="600">
+
+在这个结构中，节点间的通信效率取决于它们之间跨越的 `HyperNode` 层级。例如：
+- node0 和 node1 属于 s0，通信效率最高。
+- node1 和 node2 需要跨越两层 `HyperNode`（s0→s2→s1），通信效率较低。
+
+其中 `Tier` 表示 `HyperNode` 的层级，层级越低，`HyperNode` 内节点间的通信效率越高。以下是一个 `HyperNode` 配置示例：
+
+```yaml
+apiVersion: topology.volcano.sh/v1alpha1
+kind: HyperNode
+metadata:
+  name: s0
+spec:
+  tier: 1                          # s0 位于 Tier 1
+  members:
+    - type: Node                   # 成员类型为 Node
+      selector:                    # 假设 Node 有 name: <node-name> 的 label
+        exactMatch:
+          name: node0
+    - type: Node
+      selector:
+        exactMatch:
+          name: node1
+---
+apiVersion: topology.volcano.sh/v1alpha1
+kind: HyperNode
+metadata:
+  name: s1
+spec:
+  tier: 1                          # s1 位于 Tier 1
+  members:
+    - type: Node
+      selector:
+        exactMatch:
+          name: node2
+    - type: Node
+      selector:
+        exactMatch:
+          name: node3
+---
+apiVersion: topology.volcano.sh/v1alpha1
+kind: HyperNode
+metadata:
+  name: s2
+spec:
+  tier: 2                          # s2 位于 Tier 2
+  members:
+    - type: HyperNode              # 成员类型为 HyperNode
+      selector:
+        exactMatch:
+          name: s0                 # 引用下层的 HyperNode s0
+    - type: HyperNode
+      selector:
+        exactMatch:
+          name: s1                 # 引用下层的 HyperNode s1
+```
+
+更多关于 `HyperNode` CRD 的细节请参考 [Volcano Network Topology Aware Scheduling](https://volcano.sh/en/docs/network_topology_aware_scheduling/)。
+
+Kthena 的 `ModelServing` 提供了 `networkTopology` 字段来配置 ServingGroup 级别和 Role 级别的网络拓扑约束。下面配置表示整个 ServingGroup 的 Pod 允许跨越 Tier 2 的 HyperNode（s2），即可以分布在 s0 和 s1 之间；而同一 Role 内的 Pod 只能在 Tier 1 的 HyperNode 内（必须在同一个 s0 或 s1 内）。
+
+```yaml
+apiVersion: workload.serving.volcano.sh/v1alpha1
+kind: ModelServing
+metadata:
+  name: sample
+  namespace: default
+spec:
+  schedulerName: volcano
+  replicas: 1  # servingGroup replicas
+  template:
+    networkTopology:
+      groupPolicy:        # ServingGroup 级别的网络拓扑
+        mode: hard
+        highestTierAllowed: 2
+      rolePolicy:         # Role 级别的网络拓扑
+        mode: hard
+        highestTierAllowed: 1
+    roles:
+      - name: prefill
+        replicas: 2
+        # ......
+      - name: decode
+        replicas: 1
+        # ......
+```
+
+Kthena 中 ModelServing、ServingGroup、Role 和 Pod 的层级关系如下：
+
+```
+ModelServing: sample
+├── ServingGroup: sample-0 (replicas 中的第 1 个)
+│   ├── Prefill Role
+│   │   ├── prefill-0: sample-0-prefill-0-0, sample-0-prefill-0-1
+│   │   └── prefill-1: sample-0-prefill-1-0, sample-0-prefill-1-1
+│   └── Decode Role
+│       └── decode-0: sample-0-decode-0-0, sample-0-decode-0-1
+│
+├── ServingGroup: sample-1 (如果 replicas=2)
+│   ├── Prefill Role
+│   │   └── ...
+│   └── Decode Role
+│       └── ...
+```
+
+基于上述网络拓扑和 ModelServing 配置，Pod 可能的调度情况如下。这个调度结果体现了 `groupPolicy` 和 `rolePolicy` 的区别：
+- **rolePolicy (Tier 1)**：同一 Role 的所有 Pod 必须在同一个 Tier 1 HyperNode 内，因此 Prefill 的 4 个 Pod 都在 s0，Decode 的 2 个 Pod 都在 s1。
+- **groupPolicy (Tier 2)**：不同 Role 可以分布在不同的 Tier 1 HyperNode，只要都在 Tier 2 范围内，因此 Prefill 在 s0、Decode 在 s1 是允许的。
+
+```mermaid
+graph TD
+    subgraph s2["s2 (Tier 2) - ServingGroup 范围"]
+        subgraph s0["s0 (Tier 1) - Prefill Role"]
+            subgraph Node0["Node0"]
+                p0_0["sample-0-prefill-0-0"]
+                p0_1["sample-0-prefill-0-1"]
+            end
+            subgraph Node1["Node1"]
+                p1_0["sample-0-prefill-1-0"]
+                p1_1["sample-0-prefill-1-1"]
+            end
+        end
+        subgraph s1["s1 (Tier 1) - Decode Role"]
+            subgraph Node2["Node2"]
+                d0_0["sample-0-decode-0-0"]
+                d0_1["sample-0-decode-0-1"]
+            end
+            subgraph Node3["Node3"]
+                empty["(空闲)"]
+            end
+        end
+    end
+
+    style s0 fill:#e1f5fe
+    style s1 fill:#fff3e0
+    style p0_0 fill:#81d4fa
+    style p0_1 fill:#81d4fa
+    style p1_0 fill:#81d4fa
+    style p1_1 fill:#81d4fa
+    style d0_0 fill:#ffcc80
+    style d0_1 fill:#ffcc80
+    style empty fill:#f5f5f5
+```
+
+- `groupPolicy.highestTierAllowed: 2`：整个 ServingGroup 的所有 Pod 可以分布在 s2 内的不同 Tier 1 HyperNode（s0 和 s1）中。
+- `rolePolicy.highestTierAllowed: 1`：同一 Role 的所有 Pod 必须在同一个 Tier 1 HyperNode 内。因此 prefill 的所有 Pod 都在 s0 内，decode 的所有 Pod 都在 s1 内。
+
+**关键字段说明**：
+
+- `groupPolicy`：ServingGroup 级别的网络拓扑约束，约束整个 ServingGroup 内所有 Pod 的网络拓扑距离。
+- `rolePolicy`：Role 级别的网络拓扑约束，约束同一 Role 内所有 Pod 的网络拓扑距离。
+- `mode`：调度模式。
+  - `hard`：硬约束，作业内的任务必须部署在同一 HyperNode 内。
+  - `soft`：软约束，尽可能将任务部署在同一 HyperNode 内。
+- `highestTierAllowed`：与 `hard` 模式配合使用，表示作业部署允许的最高 HyperNode 层级。
+
+**更多 Kthena 网络拓扑细节参考**：https://kthena.volcano.sh/docs/user-guide/network-topology
+
+### Autoscaler
+
+Kthena Autoscaler 根据实时负载动态调整推理实例数量，在维护健康的业务指标（如 SLO）的同时优化计算资源消耗。Autoscaler 通过两个 CRD 进行配置：
+
+- **AutoscalingPolicy**：定义核心扩缩容策略、指标和行为参数。
+- **AutoscalingPolicyBinding**：将策略绑定到目标资源并指定扩缩容的副本数边界。
+
+Kthena Autoscaler 提供两种扩缩容粒度：**同构实例扩缩容** 和 **异构实例扩缩容**。
+
+#### 同构实例扩缩容（Homogeneous）
+
+针对单一类型推理实例的扩缩容，类似于 Knative 的 KPA，支持 `Stable` 和 `Panic` 两种模式：
+
+```yaml
+apiVersion: workload.serving.volcano.sh/v1alpha1
+kind: AutoscalingPolicy
+metadata:
+  name: scaling-policy
+spec:
+  metrics:
+  - metricName: kthena:num_requests_waiting   # 监控指标
+    targetValue: 10.0                          # 目标值
+  tolerancePercent: 10                         # 容忍度，防止频繁扩缩容
+  behavior:
+    scaleUp:
+      panicPolicy:                             # Panic 模式：流量突增时快速扩容
+        panicThresholdPercent: 150             # 超过目标值 150% 时触发
+        panicModeHold: 5m
+      stablePolicy:                            # Stable 模式：稳定扩容
+        stabilizationWindow: 1m
+        period: 30s
+    scaleDown:
+      stabilizationWindow: 5m                  # 缩容稳定窗口，避免过早缩容
+      period: 1m
+---
+apiVersion: workload.serving.volcano.sh/v1alpha1
+kind: AutoscalingPolicyBinding
+metadata:
+  name: scaling-binding
+spec:
+  policyRef:
+    name: scaling-policy
+  homogeneousTarget:
+    target:
+      targetRef:
+        kind: ModelServing
+        name: example-model-serving
+    minReplicas: 2
+    maxReplicas: 10
+```
+
+#### 异构实例扩缩容（Heterogeneous）
+
+对于同一模型，推理实例可以部署在多种配置上：
+- 异构资源类型（GPU/NPU）
+- 不同推理引擎（vLLM/SGLang）
+- 不同运行时参数（如 TP/DP 配置）
+
+这些不同部署的实例提供相同的推理服务，但在硬件资源需求和性能上有所不同。异构扩缩容通过成本优化算法，在满足性能需求的同时最小化资源成本：
+
+```yaml
+apiVersion: workload.serving.volcano.sh/v1alpha1
+kind: AutoscalingPolicyBinding
+metadata:
+  name: optimizer-binding
+spec:
+  policyRef:
+    name: optimizer-policy
+  heterogeneousTarget:
+    costExpansionRatePercent: 20               # 成本扩展率
+    params:
+    - target:
+        targetRef:
+          kind: ModelServing
+          name: gpu-serving-instance           # GPU 实例
+      minReplicas: 1
+      maxReplicas: 5
+      cost: 100                                # 成本权重
+    - target:
+        targetRef:
+          kind: ModelServing
+          name: cpu-serving-instance           # CPU 实例
+      minReplicas: 2
+      maxReplicas: 8
+      cost: 30                                 # 成本更低
+```
+
+#### Role 级别扩缩容
+
+对于 P/D 分离场景，可以针对特定 Role（如 Prefill 或 Decode）独立配置扩缩容策略：
+
+```yaml
+apiVersion: workload.serving.volcano.sh/v1alpha1
+kind: AutoscalingPolicyBinding
+metadata:
+  name: role-binding
+spec:
+  policyRef:
+    name: scaling-policy
+  homogeneousTarget:
+    target:
+      targetRef:
+        kind: ModelServing
+        name: example-model-serving
+      subTargets:
+        kind: Role
+        name: prefill                          # 仅针对 prefill role 扩缩容
+    minReplicas: 1
+    maxReplicas: 5
+```
+
+参考资料：
+
+- [Autoscaler User Guide](https://kthena.volcano.sh/docs/user-guide/autoscaler)
+- [Autoscaler Architecture](https://kthena.volcano.sh/docs/architecture/autoscaler)
