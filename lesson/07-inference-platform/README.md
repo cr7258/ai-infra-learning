@@ -1257,25 +1257,26 @@ spec:
 
 ### Engine Runtime
 
-Engine Runtime 通过 `ClusterEngineRuntimeProfile` CRD 为推理引擎注入 sidecar 容器，解决分布式推理场景下的运行时协调问题：
+`ClusterEngineRuntimeProfile` 是一个**集群级别的 CRD**，定义可复用的 sidecar 容器配置。RBG 会将这些容器注入到 Pod 中，用于处理分布式推理场景下的运行时协调工作。
+
+**1. 定义 ClusterEngineRuntimeProfile**（集群级别，可被多个 RoleBasedGroup 复用）。支持配置 `initContainers`（初始化容器）、`containers`（sidecar 容器）、`volumes`（卷）和 `updateStrategy`（更新策略）：
 
 ```yaml
-# 定义可复用的运行时配置
 apiVersion: workloads.x-k8s.io/v1alpha1
 kind: ClusterEngineRuntimeProfile
 metadata:
   name: sglang-pd-runtime
 spec:
-  containers:
+  containers:                              # Sidecar 容器，与主容器并行运行
     - name: patio-runtime
       image: rolebasedgroup/rbgs-patio-runtime:v0.5.0
       env:
         - name: TOPO_TYPE
           value: "sglang"
-  updateStrategy: NoUpdate
+  updateStrategy: NoUpdate                 # NoUpdate: Profile 更新不触发 Pod 重建
 ```
 
-在 Role 中引用 Engine Runtime：
+**2. 在 RoleBasedGroup 中引用**。通过 `engineRuntimes.profileName` 引用上面定义的 Profile，RBG 会自动将 sidecar 容器注入到该 Role 的所有 Pod 中：
 
 ```yaml
 roles:
@@ -1283,10 +1284,6 @@ roles:
     replicas: 1
     engineRuntimes:
       - profileName: sglang-pd-runtime       # 引用 ClusterEngineRuntimeProfile
-        containers:
-        - name: patio-runtime                # 可覆盖容器参数
-          args:
-          - --instance-info={"data":{"port":8000,"worker_type":"prefill"}}
     template:
       spec:
         containers:
@@ -1294,13 +1291,13 @@ roles:
           image: lmsysorg/sglang:v0.5.3.post3
 ```
 
-RBG 提供的 **Patio Runtime** sidecar 主要功能：
+RBG 提供的 **Patio Runtime** 是一个 Python sidecar，主要功能：
 
 | 功能 | 说明 |
 |------|------|
-| **自动注册** | Prefill/Decode 启动后自动向 Router 注册 |
-| **拓扑注入** | 从 RBG ConfigMap 读取集群拓扑，注入到推理引擎 |
-| **健康探测** | 监控推理引擎状态，异常时从 Router 注销 |
-| **Metrics 代理** | 收集推理指标，暴露给 Prometheus |
+| **Topology Management** | 管理分布式推理的拓扑发现（如 P/D 分离场景中 Decode 发现 Prefill） |
+| **LoRA Adapter Management** | 动态加载/卸载 LoRA 适配器 |
+| **Prometheus Metrics** | 从推理引擎（vLLM/SGLang）收集指标并暴露给 Prometheus |
+| **Health Check** | 提供健康检查和就绪探测端点 |
 
 Engine Runtime 让推理引擎专注于推理本身，运行时协调工作由 sidecar 自动处理。
