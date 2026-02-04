@@ -1075,7 +1075,7 @@ spec:
 - 不同推理引擎（vLLM/SGLang）
 - 不同运行时参数（如 TP/DP 配置）
 
-这些不同部署的实例提供相同的推理服务，但在硬件资源需求和性能上有所不同。异构扩缩容通过成本优化算法，在满足性能需求的同时最小化资源成本：
+这些不同部署的实例提供相同的推理服务，但在硬件资源需求和性能上有所不同。使用异构扩缩容时，需要为每种配置分别创建一个 ModelServing（如 `gpu-serving-instance` 和 `cpu-serving-instance`），然后通过 `AutoscalingPolicyBinding` 的 `heterogeneousTarget` 将它们绑定到同一个扩缩容策略。Autoscaler 通过成本优化算法，在满足性能需求的同时最小化资源成本：
 
 ```yaml
 apiVersion: workload.serving.volcano.sh/v1alpha1
@@ -1132,3 +1132,175 @@ spec:
 
 - [Autoscaler User Guide](https://kthena.volcano.sh/docs/user-guide/autoscaler)
 - [Autoscaler Architecture](https://kthena.volcano.sh/docs/architecture/autoscaler)
+
+## RoleBasedGroup
+
+[RoleBasedGroup (RBG)](https://github.com/sgl-project/rbg/) 用于编排分布式、有状态的 AI 推理工作负载，支持**多角色协同**和**内置服务发现**。它为生产环境中的大语言模型推理（尤其是解耦架构，如 Prefill/Decode 分离场景）提供了通用的部署范式。
+
+### Instance 和 InstanceSet
+
+RoleBasedGroup 支持为每个 Role 指定不同的底层 workload 类型，默认使用 **StatefulSet**，也可以指定 **Deployment**、**LeaderWorkerSet** 或 **InstanceSet**。
+
+**InstanceSet** 是 RBG 引入的新 workload 类型，管理多个 Instance 副本，支持**原地更新**和滚动更新。每个 **Instance** 是一个逻辑推理实例，可以包含多个 Pod（如 leader + worker），这些 Pod 的生命周期同步（Gang Scheduling、同步启停、一个 Pod 失败时整个 Instance 重启）：
+
+```
+InstanceSet: deepseek (replicas: 3)
+├── Instance: deepseek-0
+│   ├── Pod: deepseek-0-leader-0
+│   ├── Pod: deepseek-0-worker-0
+│   ├── Pod: deepseek-0-worker-1
+│   └── Pod: deepseek-0-worker-2
+├── Instance: deepseek-1
+│   ├── Pod: deepseek-1-leader-0
+│   └── ...
+└── Instance: deepseek-2
+    └── ...
+```
+
+对应的 RoleBasedGroup 配置（使用 `leaderWorkerSet` 配置模式）。注意：这里的 `leaderWorkerSet` 是 **RBG 自己的配置字段**，用于描述 leader-worker 拓扑，而不是使用外部的 LeaderWorkerSet (LWS) workload。实际创建的是 RBG 的 **InstanceSet** 资源：
+
+```yaml
+apiVersion: workloads.x-k8s.io/v1alpha1
+kind: RoleBasedGroup
+metadata:
+  name: deepseek
+spec:
+  roles:
+    - name: engine
+      replicas: 3                              # 3 个 Instance
+      workload:
+        apiVersion: workloads.x-k8s.io/v1alpha1
+        kind: InstanceSet
+      template:                                # 基础模板（Leader 和 Worker 共用）
+        spec:
+          containers:
+            - name: main
+              image: vllm/vllm-openai:v0.8.0
+              resources:
+                limits:
+                  nvidia.com/gpu: "8"
+      leaderWorkerSet:
+        size: 4                                # 每个 Instance 包含 4 个 Pod (1 leader + 3 workers)
+        patchLeaderTemplate:                   # Leader 差异化配置（patch 到基础模板）
+          spec:
+            containers:
+              - name: main
+                command:
+                  - bash
+                  - -c
+                  - |
+                    ray start --head --port=6379
+                    python -m vllm.entrypoints.openai.api_server --model=Qwen/Qwen2.5-7B-Instruct --tensor-parallel-size=4
+        patchWorkerTemplate:                   # Worker 差异化配置（patch 到基础模板）
+          spec:
+            containers:
+              - name: main
+                command:
+                  - bash
+                  - -c
+                  - ray start --address=$(LWS_LEADER_ADDRESS):6379 --block
+```
+
+> **为什么使用 `patchLeaderTemplate` / `patchWorkerTemplate`？**
+>
+> 与 LWS 需要分别定义完整的 `leaderTemplate` 和 `workerTemplate` 不同，RBG 采用**基础模板 + patch** 的方式：
+> - `template`：定义 Leader 和 Worker 共用的配置（镜像、资源、卷挂载等）。
+> - `patchLeaderTemplate` / `patchWorkerTemplate`：只定义差异部分（如启动命令）。
+>
+> 这种设计**减少了 YAML 重复**，当 Leader 和 Worker 大部分配置相同时（通常只有启动命令不同），不需要写两份完整的模板。
+
+### 原地更新
+
+InstanceSet 支持 **In-place Update**（原地更新），当修改 Pod Template 的 metadata 或 image 时，只重启容器而不删除重建 Pod。
+
+**重建升级 vs 原地升级**
+
+传统的重建升级需要删除旧 Pod、创建新 Pod，会带来以下变化：
+- Pod 名字和 UID 发生变化（如 Deployment 升级），或 Pod 名字不变但 UID 变化（如 StatefulSet 升级）。
+- Pod 所在 Node 可能变化，因为新 Pod 大概率不会调度到原来的节点。
+- Pod IP 发生变化，因为新 Pod 大概率不会被分配到原来的 IP 地址。
+
+而原地升级复用同一个 Pod 对象，只修改其中的字段，因此：
+- **避免额外操作**：无需重新调度、分配 IP、挂载磁盘等。
+- **更快的镜像拉取**：可复用已有镜像的大部分 layer，只需拉取变化的 layer。
+- **其他容器不受影响**：当一个容器原地升级时，Pod 中的其他容器仍然正常运行。
+- **复用本地缓存**：可保留本地已加载的模型参数、KVCache 等数据。
+
+<img src="https://chengzw258.oss-cn-beijing.aliyuncs.com/Article/20260201221611145.png" width="600">
+
+在 RoleBasedGroup 中启用原地更新，需要指定 `workload.kind: InstanceSet` 和 `rollingUpdate.type: InPlaceIfPossible`：
+
+```yaml
+apiVersion: workloads.x-k8s.io/v1alpha1
+kind: RoleBasedGroup
+metadata:
+  name: demo
+spec:
+  roles:
+    - name: engine
+      replicas: 3
+      workload:
+        apiVersion: workloads.x-k8s.io/v1alpha1
+        kind: InstanceSet                     # 使用 InstanceSet 作为底层工作负载
+      rolloutStrategy:
+        type: RollingUpdate
+        rollingUpdate:
+          type: InPlaceIfPossible             # 启用原地更新
+      template:
+        spec:
+          containers:
+            - name: main
+              image: vllm/vllm-openai:v0.8.0   # 更新镜像会触发原地更新
+              args:
+                - --model=Qwen/Qwen2.5-7B-Instruct
+```
+
+### Engine Runtime
+
+Engine Runtime 通过 `ClusterEngineRuntimeProfile` CRD 为推理引擎注入 sidecar 容器，解决分布式推理场景下的运行时协调问题：
+
+```yaml
+# 定义可复用的运行时配置
+apiVersion: workloads.x-k8s.io/v1alpha1
+kind: ClusterEngineRuntimeProfile
+metadata:
+  name: sglang-pd-runtime
+spec:
+  containers:
+    - name: patio-runtime
+      image: rolebasedgroup/rbgs-patio-runtime:v0.5.0
+      env:
+        - name: TOPO_TYPE
+          value: "sglang"
+  updateStrategy: NoUpdate
+```
+
+在 Role 中引用 Engine Runtime：
+
+```yaml
+roles:
+  - name: prefill
+    replicas: 1
+    engineRuntimes:
+      - profileName: sglang-pd-runtime       # 引用 ClusterEngineRuntimeProfile
+        containers:
+        - name: patio-runtime                # 可覆盖容器参数
+          args:
+          - --instance-info={"data":{"port":8000,"worker_type":"prefill"}}
+    template:
+      spec:
+        containers:
+        - name: sglang-prefill
+          image: lmsysorg/sglang:v0.5.3.post3
+```
+
+RBG 提供的 **Patio Runtime** sidecar 主要功能：
+
+| 功能 | 说明 |
+|------|------|
+| **自动注册** | Prefill/Decode 启动后自动向 Router 注册 |
+| **拓扑注入** | 从 RBG ConfigMap 读取集群拓扑，注入到推理引擎 |
+| **健康探测** | 监控推理引擎状态，异常时从 Router 注销 |
+| **Metrics 代理** | 收集推理指标，暴露给 Prometheus |
+
+Engine Runtime 让推理引擎专注于推理本身，运行时协调工作由 sidecar 自动处理。
