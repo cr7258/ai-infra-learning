@@ -1301,3 +1301,578 @@ RBG 提供的 **Patio Runtime** 是一个 Python sidecar，主要功能：
 | **Health Check** | 提供健康检查和就绪探测端点 |
 
 Engine Runtime 让推理引擎专注于推理本身，运行时协调工作由 sidecar 自动处理。
+
+## OME (Open Model Engine) 
+
+> 参考：[OME 官方博客](./ome.md) | [GitHub](https://github.com/sgl-project/ome) | [文档](https://docs.sglang.io/ome)
+
+### 背景与核心理念
+
+在大型组织部署 LLM 时，通常存在两个需求冲突的团队：
+
+**ML 工程师**花费数月时间进行模型基准测试、实验各种推理技术、制定最优部署策略。每个模型都需要不同的配置——Llama 70B 需要 Tensor 并行，DeepSeek V3/R1 需要 Expert 并行，多模态模型需要特殊设置。参数配置层出不穷：batch size、KV Cache 配置、量化级别。更麻烦的是，这些配置在不同 GPU 类型（H100 vs A100 vs L40S）之间差异巨大。
+
+**平台工程师和数据科学家**只想快速部署模型。他们不应该需要理解 Tensor 并行的复杂性，或者为什么某个模型需要 4 张带 NVLink 的 GPU。他们有客户在等待、应用要构建、业务价值要交付。
+
+这种差距产生了一个根本性问题：ML 工程师需要一种方式将来之不易的推理知识编码为可复用的"蓝图"；平台团队需要在不成为分布式系统专家的情况下部署模型。
+
+突破来自一个简单的洞察：**模型本身应该驱动部署**。一个 Llama 模型不只是一个文件——它包含关于架构、参数量和运行需求的元数据。通过让系统"理解模型"而非"驱动部署"，可以弥合 ML 专业知识与生产简单性之间的鸿沟。
+
+**模型驱动架构使得编码和复用复杂部署策略变得简单**：
+
+- **多节点推理**：通过简单配置部署 DeepSeek V3（685B）等超大模型跨多节点运行。
+- **Prefill-Decode 分离**：将计算密集的 Prefill 与内存密集的 Decode 分开，各自独立扩缩。
+- **灵活架构**：Prefill 和 Decode 都可根据需求选择单节点或多节点配置。
+- **Serverless 部署**：模型空闲时缩容至零，降低成本。
+- **业务驱动扩缩**：基于 KV Cache、tokens/秒、延迟目标或任意自定义指标的复杂自动扩缩。
+
+**模型驱动方法不是限制，而是解放——因为 OME 深度理解模型，它可以支持 ML 工程师设计的任何部署模式，同时为生产团队保持简洁的接口。**
+
+![](https://chengzw258.oss-cn-beijing.aliyuncs.com/Article/20260205215034725.png)
+
+### BaseModel / ClusterBaseModel - 模型定义
+
+`BaseModel` 是 OME 中代表基础 AI 模型（如 Llama、Qwen、Mistral）的 Kubernetes 资源。它告诉 OME 在哪里找到模型、如何下载、以及存储在哪里。当创建 `BaseModel` 资源时，OME 自动处理模型文件的下载、解析模型配置以理解其能力，并使其在集群节点上可用。
+
+OME 提供两种模型资源：`BaseModel`（Namespace 级别，团队专用）和 `ClusterBaseModel`（Cluster 级别，组织共享），两者 spec 格式完全相同，仅可见性范围不同。
+
+**最简配置**：
+
+```yaml
+apiVersion: ome.io/v1beta1
+kind: ClusterBaseModel
+metadata:
+  name: qwen2-7b-instruct
+spec:
+  storage:
+    storageUri: hf://Qwen/Qwen2-7B-Instruct    # 模型来源 URI
+    path: /raid/models/Qwen/Qwen2-7B-Instruct  # 节点本地存储路径
+```
+
+| 字段 | 说明 |
+|------|------|
+| `storage.storageUri` | 模型来源地址，支持 `hf://`（HuggingFace）、`oci://`（OCI Object Storage）、`pvc://`（PVC） |
+| `storage.path` | 模型下载到节点的本地路径，会作为 `$(MODEL_PATH)` 注入到 Engine 容器 |
+
+**更复杂的配置示例**：
+
+```yaml
+apiVersion: ome.io/v1beta1
+kind: ClusterBaseModel
+metadata:
+  name: qwen2-7b-instruct
+  labels:
+    vendor: "Qwen"
+    model-family: "qwen2"
+spec:
+  # 基本信息
+  vendor: Qwen
+  version: "1.0.0"
+  disabled: false
+  displayName: "Qwen2 7B Instruct"
+  
+  # 模型标识（用于 Runtime 自动匹配）
+  modelType: qwen2
+  modelArchitecture: Qwen2ForCausalLM
+  modelParameterSize: 7B
+  maxTokens: 32768
+  modelCapabilities:
+    - TEXT_TO_TEXT
+  
+  # 模型格式（用于 Runtime 自动匹配）
+  modelFormat:
+    name: safetensors
+    version: "1.0.0"
+  modelFramework:
+    name: transformers
+    version: "4.41.2"
+  
+  # 存储配置
+  storage:
+    storageUri: hf://Qwen/Qwen2-7B-Instruct
+    path: /raid/models/Qwen/Qwen2-7B-Instruct
+    key: "hf-token"                             # Secret 引用（用于私有/gated 模型）
+```
+
+**Runtime 自动选择**：当 `InferenceService` 不显式指定 runtime 时，OME Controller 根据 `modelArchitecture` + `modelParameterSize` + `modelFormat` + `modelFramework` 匹配最合适的 `ServingRuntime`。
+
+**自动模型发现**：如果不填这些可选字段，Model Agent 下载模型时会自动解析 `config.json`，提取模型架构、参数量、上下文长度等信息，支持 Llama、DeepSeek、Mistral、Qwen、Phi 等主流模型家族。
+
+**可选字段说明**：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| **基本信息** | | |
+| `vendor` | string | 模型厂商（如 meta, mistral, Qwen） |
+| `version` | string | 模型版本（如 "3.1", "1.0"） |
+| `disabled` | boolean | 是否禁用该模型，默认 false |
+| `displayName` | string | 用户友好的显示名称 |
+| **模型标识** | | |
+| `modelType` | string | 架构家族（如 llama, mistral, deepseek_v3） |
+| `modelArchitecture` | string | 具体实现（如 LlamaForCausalLM, Qwen2ForCausalLM） |
+| `modelParameterSize` | string | 可读的参数量（如 7B, 70B, 405B） |
+| `maxTokens` | int32 | 模型可处理的最大 token 数 |
+| `modelCapabilities` | []string | 模型能力（如 TEXT_TO_TEXT, IMAGE_TEXT_TO_TEXT） |
+| **模型格式与框架** | | |
+| `modelFormat.name` | string | 格式名称（如 safetensors, onnx, pytorch） |
+| `modelFormat.version` | string | 格式版本 |
+| `modelFramework.name` | string | 框架名称（如 transformers, tensorrt） |
+| `modelFramework.version` | string | 框架版本（如 4.36.0） |
+| `quantization` | string | 量化方案（如 fp8, fbgemm_fp8, int4） |
+| **存储配置** | | |
+| `storage.storageUri` | string | 模型来源 URI |
+| `storage.path` | string | 模型在节点上的本地存储路径 |
+| `storage.key` | string | 包含存储凭证的 Kubernetes Secret 名称 |
+| `storage.parameters` | map | 存储相关参数（如 region, auth_type） |
+| `storage.nodeSelector` | map | 节点标签选择器，控制模型下载到哪些节点 |
+| `storage.nodeAffinity` | NodeAffinity | 高级节点选择规则 |
+
+**支持的存储后端**：
+
+| 协议 | 格式 | 示例 |
+|------|------|------|
+| HuggingFace | `hf://{model-id}[@{branch}]` | `hf://meta-llama/Llama-3.1-8B-Instruct` |
+| OCI Object Storage | `oci://n/{namespace}/b/{bucket}/o/{path}` | `oci://n/ai-models/b/llm/o/llama-70b/` |
+| PVC | `pvc://[{namespace}:]{pvc-name}/{path}` | `pvc://model-storage/llama-models/` |
+
+### ServingRuntime / ClusterServingRuntime - 运行时模板
+
+`ServingRuntime` 封装了 **ML 工程师的调优经验**，定义如何运行特定类型的模型。与模型资源类似，`ServingRuntime`（Namespace 级别）和 `ClusterServingRuntime`（Cluster 级别）spec 格式相同，仅可见性范围不同。
+
+**最简配置**：
+
+```yaml
+apiVersion: ome.io/v1beta1
+kind: ClusterServingRuntime
+metadata:
+  name: srt-qwen2-7b-instruct
+spec:
+  engineConfig:
+    runner:
+      image: docker.io/lmsysorg/sglang:v0.5.5.post3-cu129-amd64
+      command:
+        - python3
+        - -m
+        - sglang.launch_server
+        - --model-path
+        - $(MODEL_PATH)              # OME 自动注入模型路径
+        - --host
+        - "0.0.0.0"
+        - --port
+        - "8080"
+```
+
+| 字段 | 说明 |
+|------|------|
+| `engineConfig.runner.image` | 推理引擎容器镜像 |
+| `engineConfig.runner.command` | 启动命令，`$(MODEL_PATH)` 由 Controller 自动注入 |
+
+> `runner` 内嵌标准 Kubernetes Container spec，可按需添加 `resources`、`env`、`volumeMounts` 等字段。如需 Runtime 自动匹配，可添加 `supportedModelFormats` 字段（见下方示例）。
+
+**包含可选字段的配置示例**：
+
+```yaml
+apiVersion: ome.io/v1beta1
+kind: ClusterServingRuntime
+metadata:
+  name: srt-qwen2-7b-instruct
+spec:
+  # 支持的模型格式（用于自动匹配）
+  supportedModelFormats:
+    - modelFramework:
+        name: transformers
+        version: "4.41.2"
+      modelFormat:
+        name: safetensors
+      modelArchitecture: Qwen2ForCausalLM    # 匹配特定架构
+      autoSelect: true                        # 允许自动选择
+      priority: 1                             # 优先级
+  
+  # 模型大小范围（用于自动匹配）
+  modelSizeRange:
+    min: 5B
+    max: 9B
+  
+  # 协议版本
+  protocolVersions:
+    - openAI
+  
+  # Engine 配置
+  engineConfig:
+    runner:
+      image: docker.io/lmsysorg/sglang:v0.5.5.post3-cu129-amd64
+      command:
+        - python3
+        - -m
+        - sglang.launch_server
+        - --model-path
+        - $(MODEL_PATH)
+        - --host
+        - "0.0.0.0"
+        - --port
+        - "8080"
+      resources:
+        limits:
+          nvidia.com/gpu: 1
+  
+  # Router 配置（可选，用于多副本智能路由）
+  routerConfig:
+    runner:
+      image: fra.ocir.io/idqj093njucb/smg:v0.2.4.post1-dev
+      command:
+        - python3
+        - -m
+        - sglang_router.launch_router
+        - --service-discovery
+        - --service-discovery-namespace
+        - $(NAMESPACE)                        # OME 自动注入
+        - --selector
+        - component=engine ome.io/inferenceservice=$(INFERENCESERVICE_NAME)  # OME 自动注入
+```
+
+**PD Disaggregated 配置示例**（Prefill-Decode 分离）：当 `ServingRuntime` 同时配置 `engineConfig` 和 `decoderConfig` 时，OME 自动识别为 PD Disaggregated 部署模式。
+
+```yaml
+apiVersion: ome.io/v1beta1
+kind: ClusterServingRuntime
+metadata:
+  name: srt-llama-pd
+spec:
+  # Prefill 组件（Engine）
+  engineConfig:
+    runner:
+      image: docker.io/lmsysorg/sglang:v0.5.5.post3-cu129-amd64
+      command:
+        - python3
+        - -m
+        - sglang.launch_server
+        - --model-path
+        - $(MODEL_PATH)
+        - --host
+        - "0.0.0.0"
+        - --port
+        - "8080"
+        - --disaggregation-mode
+        - prefill                    # Prefill 模式
+  
+  # Decode 组件
+  decoderConfig:
+    runner:
+      image: docker.io/lmsysorg/sglang:v0.5.5.post3-cu129-amd64
+      command:
+        - python3
+        - -m
+        - sglang.launch_server
+        - --model-path
+        - $(MODEL_PATH)
+        - --host
+        - "0.0.0.0"
+        - --port
+        - "8080"
+        - --disaggregation-mode
+        - decode                     # Decode 模式
+  
+  # Router（PD 分离模式）
+  routerConfig:
+    runner:
+      image: fra.ocir.io/idqj093njucb/smg:v0.2.4.post1-dev
+      command:
+        - python3
+        - -m
+        - sglang_router.launch_router
+        - --pd-disaggregation        # 启用 PD 分离路由
+        - --service-discovery
+        - --service-discovery-namespace
+        - $(NAMESPACE)
+        - --prefill-selector
+        - component=engine ome.io/inferenceservice=$(INFERENCESERVICE_NAME)
+        - --decode-selector
+        - component=decoder ome.io/inferenceservice=$(INFERENCESERVICE_NAME)
+```
+
+**Multi-Node 多节点部署**：OME 支持两种多节点部署方式，适用于不同的推理引擎：
+
+| 推理引擎 | 多节点协调方式 | OME 部署模式 | 配置方式 |
+|----------|---------------|--------------|----------|
+| **SGLang** | NCCL 原生通信 | `MultiNode` (LeaderWorkerSet) | `engineConfig.leader` + `engineConfig.worker` |
+| **vLLM** | Ray 分布式框架 | `MultiNodeRayVLLM` (KubeRay) | annotation + `engineConfig.runner` |
+
+**SGLang** 直接使用 NCCL 进行 GPU 集合通信，需要配置：
+- `--nccl-init <leader_ip>:<port>` - NCCL rendezvous 地址
+- `--nnodes` - 总节点数
+- `--node-rank` - 当前节点编号
+
+**vLLM** 依赖 Ray 处理分布式协调（节点发现、任务调度），底层 GPU 通信仍使用 NCCL，但用户无需配置 NCCL 参数，Ray 自动处理。
+
+**Multi-Node (SGLang + LWS) 配置示例**：当 `engineConfig` 配置了 `leader` 和 `worker` 字段时，OME 自动识别为 Multi-Node 模式，并创建 LeaderWorkerSet 资源来协调多节点启动。
+
+```yaml
+apiVersion: ome.io/v1beta1
+kind: ClusterServingRuntime
+metadata:
+  name: srt-deepseek-v3-multinode
+spec:
+  engineConfig:
+    # Leader（Head）节点配置
+    leader:
+      hostNetwork: true
+      runner:
+        image: docker.io/lmsysorg/sglang:v0.5.5.post3-cu129-amd64
+        command:
+          - python3
+          - -m
+          - sglang.launch_server
+          - --model-path
+          - $(MODEL_PATH)
+          - --host
+          - "0.0.0.0"
+          - --port
+          - "8080"
+          - --tp-size
+          - "8"                          # 单节点 8 GPU
+          - --nnodes
+          - $(LWS_GROUP_SIZE)            # OME 自动注入总节点数
+          - --node-rank
+          - $(LWS_WORKER_INDEX)          # OME 自动注入节点序号
+          - --nccl-init
+          - $(LWS_LEADER_ADDRESS):5000   # OME 自动注入 Leader 地址
+        resources:
+          limits:
+            nvidia.com/gpu: 8
+    
+    # Worker 节点配置
+    worker:
+      size: 1                            # Worker 节点数量（总节点数 = 1 leader + 1 worker = 2）
+      hostNetwork: true
+      runner:
+        image: docker.io/lmsysorg/sglang:v0.5.5.post3-cu129-amd64
+        command:
+          - python3
+          - -m
+          - sglang.launch_server
+          - --model-path
+          - $(MODEL_PATH)
+          - --host
+          - "0.0.0.0"
+          - --port
+          - "8080"
+          - --tp-size
+          - "8"
+          - --nnodes
+          - $(LWS_GROUP_SIZE)
+          - --node-rank
+          - $(LWS_WORKER_INDEX)
+          - --nccl-init
+          - $(LWS_LEADER_ADDRESS):5000
+        resources:
+          limits:
+            nvidia.com/gpu: 8
+```
+
+**Multi-Node (vLLM + Ray) 配置示例**：通过 annotation 指定 `MultiNodeRayVLLM` 模式，OME 自动创建 RayCluster 资源。需要预先安装 [KubeRay Operator](https://docs.ray.io/en/latest/cluster/kubernetes/getting-started.html)。
+
+```yaml
+apiVersion: ome.io/v1beta1
+kind: ClusterServingRuntime
+metadata:
+  name: srt-vllm-multinode
+spec:
+  engineConfig:
+    annotations:
+      ome.io/deployment-mode: "MultiNodeRayVLLM"  # 指定使用 Ray 多节点模式
+    runner:
+      image: vllm/vllm-openai:latest
+      command:
+        - python3
+        - -m
+        - vllm.entrypoints.openai.api_server
+        - --model
+        - $(MODEL_PATH)
+        - --host
+        - "0.0.0.0"
+        - --port
+        - "8080"
+        - --tensor-parallel-size
+        - "8"
+        # 无需配置 NCCL 参数，Ray 自动处理分布式协调
+      resources:
+        limits:
+          nvidia.com/gpu: 8
+```
+
+> **注意**：vLLM 多节点模式下，OME 会自动创建 RayCluster（包含 Head 和 Worker 节点），用户只需提供标准的容器配置，Ray 负责节点发现和通信协调。
+
+### InferenceService - 部署编排
+
+`InferenceService` 是 OME 中编排模型服务完整生命周期的核心 Kubernetes 资源。它是一个声明式规范，描述了如何在集群中部署、扩缩容和服务 AI 模型。
+
+可以将 `InferenceService` 理解为 AI 工作负载的"部署蓝图"。它将模型（`BaseModel`/`ClusterBaseModel`）、运行时（`ServingRuntime`/`ClusterServingRuntime`）和基础设施配置整合在一起，形成完整的服务方案。
+
+OME 采用组件化架构，`InferenceService` 可由多个专用组件组成：
+
+- **Model**：引用要服务的 AI 模型（`BaseModel`/`ClusterBaseModel`）。
+- **Runtime**：引用运行时环境（`ServingRuntime`/`ClusterServingRuntime`）。
+- **Engine**：主推理组件，处理推理请求。
+- **Decoder**：可选组件，用于 PD 分离部署（Prefill-Decode 分离）。
+- **Router**：可选组件，用于请求路由和负载均衡。
+
+**配置示例**：
+
+```yaml
+apiVersion: ome.io/v1beta1
+kind: InferenceService
+metadata:
+  name: qwen2-7b-instruct
+  namespace: qwen2-7b-instruct
+spec:
+  # 引用模型
+  model:
+    name: qwen2-7b-instruct           # → ClusterBaseModel
+  
+  # 引用运行时（可选，不指定则自动选择）
+  runtime:
+    name: srt-qwen2-7b-instruct       # → ClusterServingRuntime
+  
+  # Engine 配置
+  engine:
+    minReplicas: 1
+    maxReplicas: 1
+  
+  # Router 配置
+  router:
+    minReplicas: 1
+    maxReplicas: 1
+```
+
+OME 支持多种部署模式，**大部分模式由 `ServingRuntime` 的配置字段决定**：
+
+| 模式 | 场景 | 配置方式 |
+|------|------|----------|
+| **Standard** | 单节点小模型 (7B-13B) | ServingRuntime: 只有 `engineConfig` |
+| **Standard + Router** | 需要负载均衡 | ServingRuntime: `engineConfig` + `routerConfig` |
+| **PD Disaggregated** | 高吞吐场景 | ServingRuntime: `engineConfig` + `decoderConfig` |
+| **Multi-Node (SGLang)** | 使用 SGLang 部署超大模型 | ServingRuntime: `engineConfig.leader` + `engineConfig.worker` |
+| **Multi-Node (vLLM)** | 使用 vLLM 部署超大模型 | ServingRuntime: annotation + `engineConfig.runner` |
+| **Serverless** | 成本优化 (Scale-to-Zero) | InferenceService: `engine.minReplicas: 0` |
+
+ML 工程师在 `ServingRuntime` 中预先配置好部署模式，平台团队的 `InferenceService` 只需引用该 Runtime，即可获得对应的部署架构。Multi-Node 模式支持两种方案：SGLang 使用 NCCL 原生通信（配置 `leader`/`worker`），vLLM 使用 Ray 分布式框架（配置 annotation `ome.io/deployment-mode: MultiNodeRayVLLM`）。Serverless 模式通过在 `InferenceService` 中设置 `minReplicas: 0` 启用，利用 Knative Serving 实现自动扩缩容（包括缩容到零）。
+
+**Standard 示例**（最简配置）：
+
+```yaml
+apiVersion: ome.io/v1beta1
+kind: InferenceService
+metadata:
+  name: qwen2-7b-instruct
+  namespace: qwen2-7b-instruct
+spec:
+  model:
+    name: qwen2-7b-instruct        # 引用 ClusterBaseModel，获取模型存储路径
+  runtime:
+    name: srt-qwen2-7b-instruct    # 引用 ClusterServingRuntime，获取容器镜像、启动命令、资源配置
+  engine:
+    minReplicas: 1                 # Engine 副本数配置
+    maxReplicas: 1
+```
+
+- `model.name`：引用 `ClusterBaseModel`，Controller 从中获取模型存储路径（`storage.path`），注入为 `$(MODEL_PATH)` 环境变量
+- `runtime.name`：引用 `ClusterServingRuntime`，Controller 从中获取容器镜像、启动命令、资源配置等
+- `engine`：指定推理引擎的副本数范围
+
+**Standard + Router 示例**：当有多个 Engine 副本时，可以通过 Router 提供 KV Cache-Aware Routing 等智能路由能力。
+
+```yaml
+apiVersion: ome.io/v1beta1
+kind: InferenceService
+metadata:
+  name: qwen2-7b-instruct
+  namespace: qwen2-7b-instruct
+spec:
+  model:
+    name: qwen2-7b-instruct
+  runtime:
+    name: srt-qwen2-7b-instruct
+  engine:
+    minReplicas: 2                 # 多个 Engine 副本
+    maxReplicas: 4
+  router:
+    minReplicas: 1
+    maxReplicas: 1
+```
+
+**PD 分离示例**（来自 `config/samples/isvc/deepseek-ai/deepseek-v3-pd.yaml`）：
+
+```yaml
+apiVersion: ome.io/v1beta1
+kind: InferenceService
+metadata:
+  name: deepseek-v3
+  namespace: deepseek-v3
+spec:
+  model:
+    name: deepseek-v3
+  runtime:
+    name: srt-deepseek-rdma-pd    # 引用 PD 分离模式的 ServingRuntime
+  engine:                         # Prefill 节点
+    minReplicas: 1
+    maxReplicas: 1
+  decoder:                        # Decode 节点
+    minReplicas: 1
+    maxReplicas: 1
+  router:                         # 协调 P/D 请求分发
+    minReplicas: 1
+    maxReplicas: 1
+```
+
+**Multi-Node (SGLang) 示例**：部署超大模型（如 DeepSeek V3 685B），使用 SGLang + LeaderWorkerSet 进行多节点分布式推理。
+Multi-Node 模式下，`engine.minReplicas` 指定的是 LeaderWorkerSet 的 replica 数量，每个 replica 包含 1 个 Leader 节点和 N 个 Worker 节点（由 ServingRuntime 中 `worker.size` 决定）。
+
+```yaml
+apiVersion: ome.io/v1beta1
+kind: InferenceService
+metadata:
+  name: deepseek-v3
+  namespace: deepseek-v3
+spec:
+  model:
+    name: deepseek-v3
+  runtime:
+    name: srt-deepseek-v3-multinode   # 引用 Multi-Node 模式的 ServingRuntime（SGLang + LWS）
+  engine:
+    minReplicas: 1                    # 每个 replica 包含 1 leader + N workers
+    maxReplicas: 1
+```
+
+**Multi-Node (vLLM + Ray) 示例**：使用 vLLM + KubeRay 进行多节点分布式推理。OME 自动创建 RayCluster 资源。
+
+```yaml
+apiVersion: ome.io/v1beta1
+kind: InferenceService
+metadata:
+  name: llama-405b
+  namespace: llama-405b
+spec:
+  model:
+    name: llama-3-1-405b-instruct
+  runtime:
+    name: srt-vllm-multinode          # 引用 Multi-Node 模式的 ServingRuntime（vLLM + Ray）
+  engine:
+    minReplicas: 1                    # RayCluster 副本数
+    maxReplicas: 1
+```
+
+**Serverless 示例**：利用 Knative Serving 实现自动扩缩容，包括缩容到零以优化成本。
+
+```yaml
+apiVersion: ome.io/v1beta1
+kind: InferenceService
+metadata:
+  name: llama-chat
+spec:
+  model:
+    name: llama-3-70b-instruct
+  engine:
+    minReplicas: 0                 # 启用 Scale-to-Zero
+    maxReplicas: 10
+    scaleTarget: 10                # 每个 Pod 的并发请求数
+```
