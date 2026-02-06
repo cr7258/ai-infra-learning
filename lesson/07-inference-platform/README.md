@@ -1876,3 +1876,118 @@ spec:
     maxReplicas: 10
     scaleTarget: 10                # 每个 Pod 的并发请求数
 ```
+
+## AiBrix
+
+### Batch API
+
+AIBrix Batch API 提供了一种高效的方式来异步处理大量 LLM 推理请求。它完全兼容 [OpenAI Batch API](https://platform.openai.com/docs/guides/batch)，允许用户提交批量请求在后台处理，稍后获取结果。
+
+批处理适用于不需要即时响应的工作负载，具有以下优势：
+
+- **成本效率**：在非高峰时段处理请求，优化资源利用率。
+- **更高吞吐量**：处理大量请求而无需担心速率限制。
+- **简化工作流**：通过单次批量操作提交数千个请求。
+- **保证处理**：内置重试机制和失败处理。
+
+Batch API 接受包含多个推理请求的 JSONL（JSON Lines）文件，使用 Kubernetes Jobs 异步处理，并在对应的 JSONL 输出文件中返回结果。
+
+```python
+import json
+import time
+from openai import OpenAI
+
+# Configure client for AIBrix
+client = OpenAI(
+    base_url="http://your-aibrix-endpoint:80/v1",
+    api_key="dummy-key"  # Replace with actual key if authentication is enabled
+)
+
+# Step 1: Create batch input file
+batch_requests = [
+    {
+        "custom_id": f"request-{i}",
+        "method": "POST",
+        "url": "/v1/chat/completions",
+        "body": {
+            "model": "gpt-oss-120b",
+            "messages": [
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": f"Tell me a fact about the number {i}."}
+            ],
+            "max_tokens": 100
+        }
+    }
+    for i in range(1, 11)  # 10 requests
+]
+
+# Write to JSONL file
+with open("batch_requests.jsonl", "w") as f:
+    for request in batch_requests:
+        f.write(json.dumps(request) + "\n")
+
+# Step 2: Upload file
+with open("batch_requests.jsonl", "rb") as f:
+    batch_file = client.files.create(
+        file=f,
+        purpose="batch"
+    )
+
+print(f"Uploaded file: {batch_file.id}")
+
+# Step 3: Create batch
+batch = client.batches.create(
+    input_file_id=batch_file.id,
+    endpoint="/v1/chat/completions",
+    completion_window="24h"
+)
+
+print(f"Created batch: {batch.id}")
+
+# Step 4: Wait for completion
+while batch.status not in ["completed", "failed", "expired", "cancelled"]:
+    time.sleep(10)
+    batch = client.batches.retrieve(batch.id)
+    print(f"Status: {batch.status}")
+
+if batch.status == "completed":
+    print(f"Batch completed!")
+    print(f"Total requests: {batch.request_counts.total}")
+    print(f"Completed: {batch.request_counts.completed}")
+    print(f"Failed: {batch.request_counts.failed}")
+
+    # Step 5: Download results
+    output_file_id = batch.output_file_id
+    result_content = client.files.content(output_file_id)
+
+    # Save results
+    with open("batch_results.jsonl", "wb") as f:
+        f.write(result_content.content)
+
+    # Process results
+    with open("batch_results.jsonl", "r") as f:
+        for line in f:
+            result = json.loads(line)
+            custom_id = result["custom_id"]
+            content = result["response"]["body"]["choices"][0]["message"]["content"]
+            print(f"{custom_id}: {content}")
+else:
+    print(f"Batch failed with status: {batch.status}")
+```
+
+### 分布式 KV Cache
+
+随着大语言模型需求的增长，高效的内存管理和缓存对于优化推理性能、降低成本变得至关重要。在多轮对话（如聊天机器人、Agent 系统）等场景中，重叠的 token 序列会导致 prefill 阶段的冗余计算，浪费资源并限制吞吐量。
+
+许多推理引擎（如 vLLM）使用内置 KV Cache 来缓解此问题，利用空闲的 HBM 和 DRAM。然而，单节点 KV Cache 面临关键限制：内存容量受限、引擎级别的存储无法跨实例共享，以及难以支持 KV 迁移和 Prefill-Decode 分离等场景。
+
+![](https://chengzw258.oss-cn-beijing.aliyuncs.com/Article/20260206093525602.png)
+
+AIBrix 引入了生产级的 **KV Cache Offloading 框架**，实现高效的内存分层和低开销的跨引擎复用：
+
+- **数据平面**：通过 AIBrix Offloading Connector 与推理引擎（如 vLLM）紧密集成，使用优化的 CUDA 内核加速 GPU 与 CPU 之间的数据移动。
+- **多层缓存管理器**：在存储层之间动态平衡工作负载，缓解 GPU 内存容量限制同时最小化延迟损耗。默认启用 **L1 DRAM 缓存**，已能显著减轻 GPU 内存压力；对于需要多节点共享的场景，可选启用 **L2 远程缓存**（如 InfiniStore），解锁分布式 KV Cache 层的能力。
+- **可插拔淘汰策略**：支持 LRU、S3FIFO 等策略，以及多种后端存储选项，实现选择性 KV Cache Offloading 以减少网络和 PCIe 争用。
+- **缓存放置模块**：与集中式分布式 KV Cache 集群管理器协调，最大化全局 KV Cache 利用率，实现跨引擎 KV 复用和集群级资源效率，将孤立的 KV Cache 实例转变为可扩展的共享 KV Cache 基础设施。
+
+<img src="https://chengzw258.oss-cn-beijing.aliyuncs.com/Article/20260206093547643.png" width="600">
