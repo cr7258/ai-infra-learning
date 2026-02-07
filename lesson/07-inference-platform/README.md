@@ -1991,3 +1991,335 @@ AIBrix 引入了生产级的 **KV Cache Offloading 框架**，实现高效的内
 - **缓存放置模块**：与集中式分布式 KV Cache 集群管理器协调，最大化全局 KV Cache 利用率，实现跨引擎 KV 复用和集群级资源效率，将孤立的 KV Cache 实例转变为可扩展的共享 KV Cache 基础设施。
 
 <img src="https://chengzw258.oss-cn-beijing.aliyuncs.com/Article/20260206093547643.png" width="600">
+
+## KServe
+
+### 传统 ML 框架支持
+
+KServe 通过内置的 `ClusterServingRuntime` 开箱即用地支持多种 LLM 推理引擎和传统 ML 框架：
+
+| Runtime | 支持的模型格式 |
+|---------|---------------|
+| `kserve-huggingfaceserver` | HuggingFace Transformer Models（vLLM 后端） |
+| `kserve-huggingfaceserver-multinode` | HuggingFace Transformer Models（vLLM + Ray 多节点） |
+| `kserve-tritonserver` | TensorFlow, ONNX, PyTorch, TensorRT |
+| `kserve-tensorflow-serving` | TensorFlow |
+| `kserve-torchserve` | PyTorch |
+| `kserve-predictiveserver` | SKLearn, XGBoost, LightGBM |
+| `kserve-sklearnserver` | SKLearn |
+| `kserve-xgbserver` | XGBoost |
+| `kserve-lgbserver` | LightGBM |
+| `kserve-mlserver` | SKLearn, XGBoost, LightGBM, MLflow |
+| `kserve-openvino` | OpenVINO, ONNX, TensorFlow |
+| `kserve-paddleserver` | Paddle |
+| `kserve-pmmlserver` | PMML |
+
+KServe 通过 `supportedModelFormats` 实现自动匹配：用户在 `InferenceService` 中指定 `modelFormat`（如 `sklearn`、`pytorch`），KServe 自动选择对应的 `ClusterServingRuntime` 来部署，无需手动指定 runtime。
+
+### InferenceGraph
+
+随着 ML 推理系统日益庞大和复杂，往往需要多个模型协作完成一次预测。例如：人脸识别流水线需要先检测图片中的人脸，再提取人脸特征与数据库匹配；NLP 流水线需要先做文档分类，再根据分类结果进行下游的命名实体识别。
+
+> **InferenceGraph 和 Agent 框架对比**：InferenceGraph 是为传统 ML 推理管道设计的（预处理 → 模型推理 → 后处理、模型融合等），它是预定义的静态 DAG。而 LangGraph 等框架是为 LLM Agent 设计的，支持动态决策、循环、工具调用、有状态对话等能力。在 LLM 时代，InferenceGraph 的场景可能比较有限——大多数 LLM 应用直接调用单个推理端点，复杂的编排逻辑放在应用层（LangGraph、CrewAI 等）。InferenceGraph 更适合传统 ML 场景下的多模型串联/并联。
+
+KServe 在构建分布式推理图方面有独特优势：自动扩缩容的图路由器、与 InferenceService 的原生集成、以及用于模型串联的标准推理协议。基于这些能力，KServe 提供了 **InferenceGraph**，让用户以声明式、可扩缩的方式将复杂 ML 推理流水线部署到生产环境。
+
+**为什么使用 InferenceGraph？**
+
+- **多阶段流水线**：串联多个模型，前一个模型的输出作为下一个模型的输入
+- **条件路由**：根据预测结果或输入特征决定请求走向
+- **模型融合**：组合多个模型的预测结果
+- **A/B 测试**：按权重在不同模型版本之间分流
+- **独立扩缩容**：图中每个模型可以独立扩缩
+- **可复用性**：单个 InferenceService 可以被多个 Graph 共享
+
+![](https://chengzw258.oss-cn-beijing.aliyuncs.com/Article/20260207233714169.png)
+
+**核心概念**
+
+- **InferenceGraph**：由一组路由 Node 组成，每个 Node 包含一组路由 Step。每个 Step 可以路由到一个 InferenceService 或图上定义的另一个 Node，这使得 InferenceGraph 具备高度可组合性。图路由器部署在一个 HTTP 端点之后，可根据请求量动态扩缩容。
+- **Sequence Node**：按顺序依次执行多个 Step，前一步的 request/response 可以作为下一步的输入传递。
+- **Switch Node**：根据条件表达式选择匹配的 Step 执行，返回第一个匹配的结果；如果没有条件匹配，则返回原始请求。
+- **Ensemble Node**：对每个模型分别评分，然后将结果组合为一个预测响应（如多棵分类树的"多数投票"，多棵回归树的"平均"等）。
+- **Splitter Node**：按权重将流量分发到多个目标（权重之和为 100）。
+
+**示例：模型链式调用（Sequence）**
+
+一个典型的预处理 → 推理 → 后处理流水线：
+
+```yaml
+apiVersion: serving.kserve.io/v1alpha1
+kind: InferenceGraph
+metadata:
+  name: model-chaining
+spec:
+  nodes:
+    root:
+      routerType: Sequence
+      steps:
+      - serviceName: preprocessing
+      - serviceName: model-server
+        data: $response
+      - serviceName: postprocessing
+        data: $response
+```
+
+**示例：条件路由（Switch）+ 子图嵌套**
+
+根据图像分类结果，将请求路由到不同的下游检测模型：
+
+```yaml
+apiVersion: serving.kserve.io/v1alpha1
+kind: InferenceGraph
+metadata:
+  name: image-pipeline
+spec:
+  nodes:
+    root:
+      routerType: Sequence
+      steps:
+      - serviceName: image-classifier
+      - nodeName: content-router
+        data: $response
+    content-router:
+      routerType: Switch
+      steps:
+      - serviceName: nsfw-detector
+        condition: "predictions.#(label==\"person\")"
+      - serviceName: fake-ad-detector
+        condition: "predictions.#(label==\"product\")"
+      - serviceName: general-detector
+        condition: "predictions.#(label==\"other\")"
+```
+
+**示例：A/B 测试（Splitter）**
+
+将 80% 流量发送到新版模型，20% 到旧版模型：
+
+```yaml
+apiVersion: serving.kserve.io/v1alpha1
+kind: InferenceGraph
+metadata:
+  name: ab-testing
+spec:
+  nodes:
+    root:
+      routerType: Splitter
+      steps:
+      - serviceName: model-v1
+        weight: 20
+      - serviceName: model-v2
+        weight: 80
+```
+
+**示例：模型融合（Ensemble）**
+
+并行调用多个模型，合并结果：
+
+```yaml
+apiVersion: serving.kserve.io/v1alpha1
+kind: InferenceGraph
+metadata:
+  name: model-ensemble
+spec:
+  nodes:
+    root:
+      routerType: Ensemble
+      steps:
+      - serviceName: sklearn-model
+        name: sklearn
+      - serviceName: xgboost-model
+        name: xgboost
+```
+
+### Local Model Cache
+
+通过将 LLM 模型缓存到本地存储，可以大幅缩短 InferenceService 的启动时间。对于多副本部署，本地持久卷可以为多个 Pod 提供已预热的模型缓存。
+
+该功能引入了以下 CRD：
+
+- **LocalModelCache**：指定将哪个模型（如 Hugging Face Hub 上的模型）下载并缓存到 Kubernetes 节点的本地存储。
+- **LocalModelNodeGroup**：管理用于缓存模型和本地持久存储的节点组。
+- **LocalModelNode**：跟踪给定节点上模型缓存的状态。
+
+**工作流程**：
+
+1. 创建 `LocalModelNodeGroup`，定义节点选择条件和本地存储配置（如 NVMe）。KServe 会在匹配的节点上创建 Agent DaemonSet 来监控本地模型缓存生命周期。
+2. 创建 `LocalModelCache`，指定模型源地址（`sourceModelUri`）和目标节点组。KServe 自动在各节点上创建下载 Job，将模型预下载到本地存储。
+3. 部署 `InferenceService` 时，只要 `storageUri` 与 `LocalModelCache` 的 `sourceModelUri` 匹配，KServe 就会自动使用本地缓存，跳过远程下载。
+
+**Step 1: 配置模型下载凭证**
+
+`ClusterStorageContainer` 用于定义模型下载所使用的存储初始化容器（storage initializer），包括容器镜像、认证凭证和支持的模型来源（如 `hf://` 对应 Hugging Face Hub，`s3://` 对应 AWS S3 等）。这里创建一个 `ClusterStorageContainer` 引用 Hugging Face Token Secret，`supportedUriFormats` 指定匹配 `hf://` 开头的模型 URI，`workloadType: localModelDownloadJob` 表示该配置用于本地模型下载 Job。
+
+```yaml
+apiVersion: "serving.kserve.io/v1alpha1"
+kind: ClusterStorageContainer
+metadata:
+  name: hf-hub
+spec:
+  container:
+    name: storage-initializer
+    image: kserve/storage-initializer:latest
+    env:
+    - name: HF_TOKEN
+      valueFrom:
+        secretKeyRef:
+          name: hf-secret
+          key: HF_TOKEN
+    resources:
+      requests:
+        memory: 2Gi
+        cpu: "1"
+      limits:
+        memory: 4Gi
+        cpu: "1"
+  supportedUriFormats:
+    - prefix: hf://
+  workloadType: localModelDownloadJob
+```
+
+**Step 2: 创建 LocalModelNodeGroup**
+
+创建 `LocalModelNodeGroup` 定义用于缓存模型的节点组和本地持久存储。通过 `nodeAffinity` 选择哪些节点用于模型缓存，`local.path` 指定本地 NVMe 卷的挂载路径。`LocalModelNodeGroup` 创建后，KServe 会在每个匹配 `nodeAffinity` 的节点上创建 Agent DaemonSet，用于监控本地模型缓存的生命周期。
+
+```yaml
+apiVersion: serving.kserve.io/v1alpha1
+kind: LocalModelNodeGroup
+metadata:
+  name: workers
+spec:
+  storageLimit: 1.7T
+  persistentVolumeClaimSpec:
+    accessModes:
+      - ReadWriteOnce
+    resources:
+      requests:
+        storage: 1700G
+    storageClassName: local-storage
+  persistentVolumeSpec:
+    capacity:
+      storage: 1700G
+    local:
+      path: /models
+    storageClassName: local-storage
+    nodeAffinity:
+      required:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: nvidia.com/gpu-product
+                operator: In
+                values:
+                  - NVIDIA-A100-SXM4-80GB
+```
+
+**Step 3: 创建 LocalModelCache**
+
+创建 `LocalModelCache` 指定要预下载到本地存储的模型。`sourceModelUri` 为模型的远程存储地址，`nodeGroups` 指定将模型缓存到哪些节点组。
+
+```yaml
+apiVersion: serving.kserve.io/v1alpha1
+kind: LocalModelCache
+metadata:
+  name: meta-llama3-8b-instruct
+spec:
+  sourceModelUri: 'hf://meta-llama/meta-llama-3-8b-instruct'
+  modelSize: 10Gi
+  nodeGroups:
+    - workers
+```
+
+`LocalModelCache` 创建后，KServe 自动在节点组中的每个节点上创建下载 Job，将模型预下载到本地存储。可以通过 `LocalModelCache` 的 status 查看各节点的下载状态：
+
+```yaml
+status:
+  copies:
+    available: 1
+    total: 1
+  nodeStatus:
+    kind-worker: NodeDownloaded
+```
+
+**Step 4: 部署 InferenceService**
+
+部署 `InferenceService` 时，只要 `storageUri` 与 `LocalModelCache` 的 `sourceModelUri` 匹配，KServe 就会自动使用本地缓存，跳过远程下载。
+
+```yaml
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: huggingface-llama3
+spec:
+  predictor:
+    model:
+      modelFormat:
+        name: huggingface
+      storageUri: hf://meta-llama/meta-llama-3-8b-instruct
+      resources:
+        limits:
+          cpu: "6"
+          memory: 24Gi
+          nvidia.com/gpu: "1"
+```
+
+参考资料：
+- [KServe Local Model Cache](https://kserve.github.io/website/docs/model-serving/generative-inference/modelcache/localmodel)
+
+### LLMInferenceService
+
+`LLMInferenceService` 是 KServe 面向 GenAI 场景推出的新一代 CRD，基于 [llm-d](https://github.com/llm-d/llm-d) 架构构建。llm-d 结合了 vLLM 推理引擎、Kubernetes 编排和智能路由能力，提供 KV Cache 感知调度、Prefill-Decode 分离部署、分布式推理等生产级特性。`LLMInferenceService` 将这些能力封装为 Kubernetes 原生 CRD，降低了使用门槛。
+
+**为什么需要新的 CRD？**
+
+KServe 采用双轨策略：
+- **InferenceService**：面向传统预测型 AI（sklearn、TensorFlow、PyTorch 等），也可以用于简单的 LLM 单节点部署。
+- **LLMInferenceService**：专为生成式 AI 设计，提供 PD 分离、多节点编排、智能调度等 LLM 特有能力，不会给传统 `InferenceService` API 增加复杂度。
+
+**核心特性**：
+
+- **多种部署模式**：单节点、多节点（LeaderWorkerSet）、Prefill-Decode 分离、DP+EP（数据并行 + 专家并行，用于 MoE 模型）。
+- **分布式推理**：支持 Tensor Parallelism（TP）、Data Parallelism（DP）、Expert Parallelism（EP）。
+- **智能路由**：集成 Gateway API + Inference Gateway Extension，支持 KV Cache 感知调度、负载均衡路由、PD 分离自动路由。
+- **可组合配置**：通过 `[LLMInferenceServiceConfig](https://kserve.github.io/website/docs/model-serving/generative-inference/llmisvc/llmisvc-configuration?_highlight=llminferenceserviceconfig#llminferenceservice-vs-llminferenceserviceconfig)` + `baseRefs` 实现配置模板继承和覆盖。
+- **LoRA 适配器**：原生支持在模型规格中定义 LoRA 适配器。
+- **模型存储集成**：支持 HuggingFace Hub（`hf://`）、S3（`s3://`）、PVC（`pvc://`）、OCI Modelcar（`oci://`）。
+
+**核心配置**：
+
+- **`spec.model`**：定义模型来源（URI）、名称、LoRA 适配器等。
+- **`spec.template` + `spec.worker`**：定义 Decode 工作负载，`worker` 存在时触发多节点部署（LWS）。
+- **`spec.prefill`**：定义 Prefill 工作负载（PD 分离模式），可独立配置副本数、并行度和多节点。
+- **`spec.parallelism`**：定义并行策略（tensor / pipeline / data / dataLocal / expert）。
+- **`spec.router`**：定义路由配置（Gateway、HTTPRoute、Scheduler/EPP）。
+
+以下配置 Kserve 会创建：3 个推理副本（各 1 GPU）、引用已有的 Gateway 并自动创建 HTTPRoute、智能调度器（EPP）用于负载均衡，以及 Storage Initializer 自动下载模型。
+
+```yaml
+apiVersion: serving.kserve.io/v1alpha2
+kind: LLMInferenceService
+metadata:
+  name: llama-3-8b
+spec:
+  model:
+    uri: hf://meta-llama/Llama-3.1-8B-Instruct
+    name: meta-llama/Llama-3.1-8B-Instruct
+
+  replicas: 3
+
+  template:
+    containers:
+      - name: main
+        image: vllm/vllm-openai:latest
+        resources:
+          limits:
+            nvidia.com/gpu: "1"
+            cpu: "8"
+            memory: 32Gi
+
+  router:
+    gateway: {}     # 引用已有的 Gateway
+    route: {}       # Kserver 自动创建和管理 HTTPRoute
+    scheduler: {}   # Kserver 自动创建 InferencePool + EPP Scheduler
+```
+
+
